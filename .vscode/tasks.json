@@ -6,7 +6,9 @@
             "type": "shell",
             "command": "~/.platformio/penv/bin/pio",
             "args": [
-                "run"
+                "run",
+                "-e",
+                "esp32dev"
             ],
             "group": "build",
             "problemMatcher": []
@@ -18,7 +20,7 @@
             "args": [
                 "dialout",
                 "-c",
-                "~/.platformio/penv/bin/pio run --target upload"
+                "~/.platformio/penv/bin/pio run -e esp32dev --target upload"
             ],
             "group": "build",
             "problemMatcher": []

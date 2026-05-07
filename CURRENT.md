@@ -13,6 +13,7 @@ Branch: `main`
 - `onboard_device.py` reads an ESP MAC, can clean erase/flash one USB board, and can assign name/universe/mode over HTTP once the node is reachable.
 - Visible project identity, default node name, and generated AP prefix use `vizzz.di`.
 - Native Unity tests cover `vizzz_core.h` helpers.
+- VS Code PlatformIO Build/Upload tasks explicitly target `esp32dev`, so they no longer fail by trying to build the `native` test environment with `pio run`.
 - DMX output uses `DMX_NUM_1`, GPIO25 TX, GPIO21 DIR.
 - Browser console exposes control, patch, scenes, network, system, and VJ routes.
 - Embedded UI is intentionally minimal/mobile-first: hidden helper copy, compact cards, horizontal tabs, large touch targets, and WiFi first on `/network`.
@@ -73,4 +74,6 @@ Branch: `main`
 - 2026-05-07: Clean-erased and reflashed Board B `D4:E9:F4:BC:5A:64` on `/dev/ttyUSB0`; erase wipes STA credentials/NVS, so old `10.0.0.1`/`192.168.88.127` checks timed out afterward until reconnecting to the newly generated AP or reconfiguring WiFi.
 - 2026-05-07: Added `onboard_device.py` for future multi-node onboarding: MAC check, optional erase, upload, and HTTP name/universe/mode/test setup. Use it one board at a time, and verify MAC before erase.
 - 2026-05-07: Rebuilt the embedded `/vj` UI into a mobile-first VJ deck and upgraded FX behavior with depth scaling, softened chases/comet tails, travelling wave, sparkle variation, bars, and glitch. Validation: native tests PASS, esp32 build SUCCESS. RAM 52,356 bytes (16.0%), Flash 904,605 bytes (69.0%).
+- 2026-05-07: Elite multi-device identity fix (WLED-grade): (1) AP SSID now MAC-derived (`vizzz.di_AABBCC`, deterministic, survives NVS erase); (2) `WiFi.setHostname()` called before `WiFi.begin()` so DHCP table shows correct name; (3) beacon payload now includes `mac` + `ap_ssid` instead of hardcoded `ap_ip`; (4) peer self-exclusion and dedup use MAC as primary key, IP as fallback; (5) `mac` added to status JSON, `/discover`, `/peers`. Validation: native tests PASS, esp32 build SUCCESS. RAM 52,436 bytes (16.0%), Flash 905,361 bytes (69.1%).
+- 2026-05-07: Fixed `.vscode/tasks.json` so VS Code `PlatformIO: Build` and `PlatformIO: Upload` target `esp32dev` explicitly. Validation: `PlatformIO: Test` PASS, `PlatformIO: Build` PASS.
 - For TouchDesigner control: Art-Net to `192.168.88.255:6454` (broadcast) or `192.168.88.127:6454` (unicast), universe 0. Use `ARTNET_ONLY` for TD-only or `MERGE_HTP` if web layer should participate.

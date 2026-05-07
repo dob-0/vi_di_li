@@ -85,12 +85,18 @@ static bool isGeneratedNodeName(const String& name) {
   return name == PRODUCT_NAME || name.startsWith(String(PRODUCT_NAME) + "-");
 }
 
+// Returns the last 3 bytes of the STA MAC as uppercase hex (e.g. "BA6FCC").
+// Deterministic per device, survives NVS erase and firmware reflash.
+static String macSuffix6() {
+  uint8_t m[6];
+  WiFi.macAddress(m);
+  char s[7];
+  snprintf(s, sizeof(s), "%02X%02X%02X", m[3], m[4], m[5]);
+  return s;
+}
+
 static String makeNodeNameFromMac() {
-  uint64_t mac = ESP.getEfuseMac();
-  uint16_t tail = uint16_t(mac & 0xFFFF);
-  char suffix[5];
-  snprintf(suffix, sizeof(suffix), "%04X", tail);
-  return String(PRODUCT_NAME) + "-" + suffix;
+  return String(PRODUCT_NAME) + "-" + macSuffix6();
 }
 
 static void saveConfig() {
@@ -132,9 +138,9 @@ static void loadConfig() {
   if (mode > MODE_HTP) mode = MODE_HTP;
   if (netMode > NET_AP_ONLY) netMode = NET_AP_STA;
 
-  // New firmware image flashed: rotate default SSID once, then persist.
+  // Update persisted FW_TAG and regenerate node name if still default.
+  // Do NOT clear apSsid on firmware updates — suffix is random, would break reconnection.
   if (savedFwTag != FW_TAG) {
-    if (apSsid.isEmpty() || isGeneratedApSsid(apSsid)) apSsid = "";
     if (nodeName.isEmpty() || isGeneratedNodeName(nodeName)) nodeName = makeNodeNameFromMac();
     needSaveConfig = true;
   }
@@ -155,6 +161,7 @@ struct PeerNode {
   char     name[40];
   char     ip[16];
   char     mdns[48];
+  char     mac[18];   // "xx:xx:xx:xx:xx:xx\0" — used for dedup and identity
   uint32_t lastSeenMs;
 };
 static constexpr uint8_t MAX_PEERS    = 4;
@@ -386,6 +393,10 @@ static bool enqueueBcast(const char* path, const char* targetIp = nullptr) {
   return xQueueSend(bcastQueue, &entry, 0) == pdTRUE;
 }
 
+// Forward declarations needed by startWiFi()
+static String mdnsName;
+static void buildMdnsName();
+
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 // Returns the Art-Net target: peer unicast if set, else STA subnet broadcast, else AP broadcast
 static IPAddress artOutTarget() {
@@ -424,13 +435,18 @@ static void startWiFi() {
   WiFi.mode(wm);
   WiFi.setSleep(false);
 
-  // Empty AP SSID means first boot or new firmware tag: generate one random name.
+  // Empty AP SSID means first boot or clean-erased device:
+  // generate a deterministic suffix from the last 3 bytes of the MAC.
+  // This survives firmware reflash (no NVS needed) and is unique per device.
   if (apSsid.isEmpty()) {
-    char suffix[7];
-    snprintf(suffix, sizeof(suffix), "%06lX", (unsigned long)(esp_random() & 0xFFFFFF));
-    apSsid = String(AP_SSID_PREFIX) + "_" + suffix;
+    apSsid = String(AP_SSID_PREFIX) + "_" + macSuffix6();
     needSaveConfig = true;
   }
+
+  // Register DHCP hostname BEFORE connecting so the router's table is correct.
+  // Without this both devices appear as generic "espressif" in the DHCP lease list.
+  buildMdnsName();
+  WiFi.setHostname(mdnsName.c_str());
 
   if (netMode != NET_STA_ONLY) {
     startSoftAP();
@@ -454,8 +470,6 @@ static void startWiFi() {
 }
 
 // ── mDNS ──────────────────────────────────────────────────────────────────────
-static String mdnsName;
-
 static void buildMdnsName() {
   mdnsName = nodeName;
   for (size_t i = 0; i < mdnsName.length(); i++) {
@@ -480,11 +494,13 @@ static void sendBeacon() {
   uint32_t ip   = (uint32_t)WiFi.localIP();
   uint32_t mask = (uint32_t)WiFi.subnetMask();
   IPAddress bcast((ip & mask) | ~mask);
-  char buf[180];
-  char eName[64]; jsonEsc(eName, sizeof(eName), nodeName);
+  char buf[240];
+  char eName[64];   jsonEsc(eName,   sizeof(eName),   nodeName);
+  char eApSsid[64]; jsonEsc(eApSsid, sizeof(eApSsid), apSsid);
+  String mac = WiFi.macAddress();
   snprintf(buf, sizeof(buf),
-    "{\"name\":\"%s\",\"ip\":\"%s\",\"ap_ip\":\"10.0.0.1\",\"mdns\":\"%s.local\",\"product\":\"vizzz.di\"}",
-    eName, ipStr(WiFi.localIP()).c_str(), mdnsName.c_str());
+    "{\"name\":\"%s\",\"ip\":\"%s\",\"ap_ssid\":\"%s\",\"mdns\":\"%s.local\",\"mac\":\"%s\",\"product\":\"vizzz.di\"}",
+    eName, ipStr(WiFi.localIP()).c_str(), eApSsid, mdnsName.c_str(), mac.c_str());
   discoverUdp.beginPacket(bcast, DISCOVERY_PORT);
   discoverUdp.write((const uint8_t*)buf, strlen(buf));
   discoverUdp.endPacket();
@@ -494,22 +510,26 @@ static void sendBeacon() {
 static void pollDiscovery() {
   int sz = discoverUdp.parsePacket();
   if (sz <= 0) return;
-  char buf[200];
+  char buf[256];
   int n = discoverUdp.read(buf, min(sz, (int)sizeof(buf) - 1));
   if (n <= 0) return;
   buf[n] = '\0';
   if (!strstr(buf, "vizzz.di")) return;  // ignore non-vizzz packets
 
-  char pName[40], pIp[16], pIpJson[16], pMdns[48];
+  char pName[40], pIp[16], pIpJson[16], pMdns[48], pMac[18];
   if (!jsonExtract(buf, "name", pName, sizeof(pName))) return;
   if (!jsonExtract(buf, "ip",   pIpJson, sizeof(pIpJson))) return;
   jsonExtract(buf, "mdns", pMdns, sizeof(pMdns));
+  pMac[0] = '\0';
+  jsonExtract(buf, "mac",  pMac,  sizeof(pMac));
   ipToCStr(pIp, sizeof(pIp), discoverUdp.remoteIP());
 
-  // Ignore our own beacon
-  if (WiFi.status() == WL_CONNECTED) {
-    String myIp = ipStr(WiFi.localIP());
-    if (myIp == pIp) return;
+  // Ignore our own beacon — compare by MAC (reliable) with IP fallback.
+  String ownMac = WiFi.macAddress();
+  if (pMac[0] != '\0') {
+    if (strcasecmp(pMac, ownMac.c_str()) == 0) return;
+  } else if (WiFi.status() == WL_CONNECTED) {
+    if (ipStr(WiFi.localIP()) == pIp) return;
   }
 
   uint32_t now = millis();
@@ -517,9 +537,14 @@ static void pollDiscovery() {
 
   bool found = false;
   for (uint8_t i = 0; i < peerCount; i++) {
-    if (strcmp(peers[i].ip, pIp) == 0) {
+    // Match by MAC first (IP can change on DHCP rebind), fall back to IP.
+    bool match = (pMac[0] != '\0') ? (strcasecmp(peers[i].mac, pMac) == 0)
+                                   : (strcmp(peers[i].ip, pIp) == 0);
+    if (match) {
       strlcpy(peers[i].name, pName, sizeof(peers[i].name));
+      strlcpy(peers[i].ip,   pIp,   sizeof(peers[i].ip));
       strlcpy(peers[i].mdns, pMdns, sizeof(peers[i].mdns));
+      strlcpy(peers[i].mac,  pMac,  sizeof(peers[i].mac));
       peers[i].lastSeenMs = now;
       found = true;
       break;
@@ -529,6 +554,7 @@ static void pollDiscovery() {
     strlcpy(peers[peerCount].name, pName, sizeof(peers[peerCount].name));
     strlcpy(peers[peerCount].ip,   pIp,   sizeof(peers[peerCount].ip));
     strlcpy(peers[peerCount].mdns, pMdns, sizeof(peers[peerCount].mdns));
+    strlcpy(peers[peerCount].mac,  pMac,  sizeof(peers[peerCount].mac));
     peers[peerCount].lastSeenMs = now;
     peerCount++;
   }
@@ -1439,7 +1465,7 @@ async function refreshMonitor(){const r=await qs('/monitor'); if(r) $('monitorDu
 async function loadManifest(){const r=await qs('/node/manifest'); if(r) $('manifestDump').textContent=JSON.stringify(r,null,2);}
 function openManifest(){window.open('/node/manifest','_blank');}
 function peerCmd(ip,path){hit('/peer/cmd?ip='+encodeURIComponent(ip)+'&path='+encodeURIComponent(path));}
-async function loadPeers(){const r=await qs('/peers');if(!r){$('peerCount').textContent='error';return;}const c=r.count||0;$('peerCount').textContent=c?c+(c===1?' peer found':' peers found'):'none found';$('peerList').innerHTML=c?r.peers.map(p=>`<div style="padding:8px;border:1px solid var(--di-cyan-border);margin-bottom:6px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px"><div><b>${escHtml(p.name)}</b> <span class="footerNote">${escHtml(p.ip)}</span><br><span class="footerNote">${escHtml(p.mdns)||''} &bull; ${p.age_s}s ago</span></div><button onclick="window.open('http://${escJsSq(p.ip)}','_blank')" style="min-height:28px;padding:3px 10px;font-size:.7rem;flex:0 0 auto">Open UI</button></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px"><button onclick="peerCmd('${escJsSq(p.ip)}','/blackout')" style="min-height:32px;font-size:.72rem" class="bad">Blackout</button><button onclick="peerCmd('${escJsSq(p.ip)}','/full')" style="min-height:32px;font-size:.72rem" class="good">Full</button><button onclick="targetPeer('${escJsSq(p.ip)}')" style="min-height:32px;font-size:.72rem">Link AO</button></div></div>`).join(''):'<span class="footerNote">No vizzz.di nodes found. Devices must share a WiFi network. Retry after 30s.</span>';}
+async function loadPeers(){const r=await qs('/peers');if(!r){$('peerCount').textContent='error';return;}const c=r.count||0;$('peerCount').textContent=c?c+(c===1?' peer found':' peers found'):'none found';$('peerList').innerHTML=c?r.peers.map(p=>`<div style="padding:8px;border:1px solid var(--di-cyan-border);margin-bottom:6px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px"><div><b>${escHtml(p.name)}</b> <span class="footerNote">${escHtml(p.ip)}</span><br><span class="footerNote">${escHtml(p.mdns)||''} &bull; <span style="font-family:monospace;font-size:.65rem">${escHtml(p.mac)||''}</span> &bull; ${p.age_s}s ago</span></div><button onclick="window.open('http://${escJsSq(p.ip)}','_blank')" style="min-height:28px;padding:3px 10px;font-size:.7rem;flex:0 0 auto">Open UI</button></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px"><button onclick="peerCmd('${escJsSq(p.ip)}','/blackout')" style="min-height:32px;font-size:.72rem" class="bad">Blackout</button><button onclick="peerCmd('${escJsSq(p.ip)}','/full')" style="min-height:32px;font-size:.72rem" class="good">Full</button><button onclick="targetPeer('${escJsSq(p.ip)}')" style="min-height:32px;font-size:.72rem">Link AO</button></div></div>`).join(''):'<span class="footerNote">No vizzz.di nodes found. Devices must share a WiFi network. Retry after 30s.</span>';}
 function targetPeer(ip){if(!confirm('Route Art-Net OUT directly to '+ip+'? (enables unicast, overrides broadcast)'))return;fetch('/artout/peer?ip='+encodeURIComponent(ip),{cache:'no-store'}).then(()=>fetch('/artout/set?en=1',{cache:'no-store'}));artOutEnabled=true;$('aoBtn').textContent='Art OUT ON';$('aoTarget').textContent=ip;}
 function setMode(m){$('modeSel').value=String(m);hit('/mode/set?m='+m);}
 function vjPanic(){setMode(0);cueRun(0);killFx();killColor();hit('/master?v=255');updateMasterDisplays(255);blackout();}
@@ -1572,6 +1598,7 @@ static size_t fillStatusJSON(char* buf, size_t n) {
     "\"ao_target\":\"%s\","
     "\"ap_clients\":%u,"
     "\"sta_rssi\":%d,"
+    "\"mac\":\"%s\","
     "\"peer_count\":%u"
     "}",
     apIp,
@@ -1592,6 +1619,7 @@ static size_t fillStatusJSON(char* buf, size_t n) {
     outTarget,
     apClients,
     staRssi,
+    WiFi.macAddress().c_str(),
     peerCount
   );
   if (written < 0) {
@@ -1619,9 +1647,10 @@ static String peersJSON() {
       char eName[44], eMdns[52];
       jsonEsc(eName, sizeof(eName), peers[i].name);
       jsonEsc(eMdns, sizeof(eMdns), peers[i].mdns);
+      char eMac[20]; jsonEsc(eMac, sizeof(eMac), peers[i].mac);
       pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "{\"name\":\"%s\",\"ip\":\"%s\",\"mdns\":\"%s\",\"age_s\":%lu}",
-        eName, peers[i].ip, eMdns,
+        "{\"name\":\"%s\",\"ip\":\"%s\",\"mdns\":\"%s\",\"mac\":\"%s\",\"age_s\":%lu}",
+        eName, peers[i].ip, eMdns, eMac,
         (unsigned long)((now - peers[i].lastSeenMs) / 1000));
     }
     xSemaphoreGive(gLock);
@@ -2048,11 +2077,14 @@ static void setupWeb() {
   });
 
   server.on("/discover", HTTP_GET, [](AsyncWebServerRequest* r){
-    char buf[180];
-    char eName[64]; jsonEsc(eName, sizeof(eName), nodeName);
+    char buf[256];
+    char eName[64];   jsonEsc(eName,   sizeof(eName),   nodeName);
+    char eApSsid[64]; jsonEsc(eApSsid, sizeof(eApSsid), apSsid);
+    char apIp[16];    ipToCStr(apIp, sizeof(apIp), WiFi.softAPIP());
+    String mac = WiFi.macAddress();
     snprintf(buf, sizeof(buf),
-      "{\"name\":\"%s\",\"ip\":\"%s\",\"ap_ip\":\"10.0.0.1\",\"mdns\":\"%s.local\",\"product\":\"vizzz.di\"}",
-      eName, ipStr(WiFi.localIP()).c_str(), mdnsName.c_str());
+      "{\"name\":\"%s\",\"ip\":\"%s\",\"ap_ip\":\"%s\",\"ap_ssid\":\"%s\",\"mdns\":\"%s.local\",\"mac\":\"%s\",\"product\":\"vizzz.di\"}",
+      eName, ipStr(WiFi.localIP()).c_str(), apIp, eApSsid, mdnsName.c_str(), mac.c_str());
     r->send(200, "application/json", buf);
     sendBeacon();
   });
