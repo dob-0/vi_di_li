@@ -435,12 +435,18 @@ static void startWiFi() {
   WiFi.mode(wm);
   WiFi.setSleep(false);
 
-  // Empty AP SSID means first boot or clean-erased device:
-  // generate a deterministic suffix from the last 3 bytes of the MAC.
-  // This survives firmware reflash (no NVS needed) and is unique per device.
-  if (apSsid.isEmpty()) {
-    apSsid = String(AP_SSID_PREFIX) + "_" + macSuffix6();
-    needSaveConfig = true;
+  // Ensure the AP SSID is MAC-derived. Migrate any stale NVS value
+  // (e.g. old random-suffix firmware) so reflashing fixes identity automatically.
+  {
+    String expected = String(AP_SSID_PREFIX) + "_" + macSuffix6();
+    if (apSsid.isEmpty() || apSsid != expected) {
+      // Only overwrite if it looks like a vizzz.di_ SSID (not user-customised).
+      // A user-customised SSID won't start with the default prefix.
+      if (apSsid.isEmpty() || apSsid.startsWith(AP_SSID_PREFIX)) {
+        apSsid = expected;
+        needSaveConfig = true;
+      }
+    }
   }
 
   // Register DHCP hostname BEFORE connecting so the router's table is correct.
@@ -2074,6 +2080,17 @@ static void setupWeb() {
   server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest* r){
     r->send(200, "text/plain", "Rebooting…");
     pendingReboot = true;
+  });
+
+  // Factory reset: erase NVS and reboot. Restores MAC-derived SSID, default password.
+  server.on("/factory-reset", HTTP_POST, [](AsyncWebServerRequest* r){
+    r->send(200, "text/plain", "Factory reset — rebooting with defaults…");
+    delay(100);
+    Preferences p;
+    p.begin("vizzz", false);
+    p.clear();
+    p.end();
+    ESP.restart();
   });
 
   server.on("/discover", HTTP_GET, [](AsyncWebServerRequest* r){
