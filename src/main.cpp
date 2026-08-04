@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <stdarg.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiUdp.h>
@@ -9,6 +10,8 @@
 #include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+
+#include <math.h>
 
 #include "esp_dmx.h"
 #include "vizzz_core.h"
@@ -25,11 +28,20 @@ static constexpr uint32_t   ARTNET_TIMEOUT_MS = 3000;
 static constexpr uint16_t   ARTNET_PORT       = 6454;
 static constexpr uint32_t   SACN_TIMEOUT_MS   = 3000;
 static constexpr uint16_t   SACN_PORT         = 5568;
+static constexpr uint8_t    SAFE_MAX_LEVEL    = 245;
+static constexpr uint8_t    SAFE_SLEW_STEP    = 18;
+static constexpr uint8_t    BURN_SAFE_MAX_LEVEL = 96;
+static constexpr uint8_t    BURN_SAFE_SLEW_STEP = 8;
+static constexpr uint8_t    ARTNET_PKT_BUDGET = 10;
+static constexpr uint8_t    SACN_PKT_BUDGET   = 10;
+static constexpr uint8_t    OSC_PKT_BUDGET    = 14;
+static constexpr uint8_t    DISC_PKT_BUDGET   = 4;
 
 // ── Paging / Scenes ───────────────────────────────────────────────────────────
 static constexpr uint16_t PAGE_SIZE   = 32;
 static constexpr uint16_t PAGE_COUNT  = 16;
 static constexpr uint8_t  SCENE_COUNT = 8;
+static constexpr uint8_t  MAX_FIXTURES = 12;
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
 enum Mode : uint8_t { MODE_WEB = 0, MODE_ARTNET = 1, MODE_HTP = 2 };
@@ -65,6 +77,8 @@ static NetMode netMode      = NET_AP_STA;
 static bool    artOutEnabled = false;   // broadcast webVals as Art-Net to slaves
 static String  artOutPeerIp = "";       // if non-empty, unicast to this IP instead of broadcast
 static bool    webEnabled    = true;    // when false, web server and websocket stay disabled
+static bool    burnSafeMode  = false;   // temporary reduced-output profile for stress tests
+static bool    artnetFallbackToWeb = true; // use web layer when Art-Net/sACN signal is inactive
 static bool    needSaveConfig = false;  // set when auto-generated values must be persisted
 static constexpr const char* FW_TAG = __DATE__ " " __TIME__;
 static constexpr uint32_t WIFI_SCAN_TIMEOUT_MS = 15000;
@@ -113,6 +127,8 @@ static void saveConfig() {
   prefs.putUChar("net_mode",  uint8_t(netMode));
   prefs.putBool("ao_en",      artOutEnabled);
   prefs.putBool("web_en",     webEnabled);
+  prefs.putBool("burn_safe",  burnSafeMode);
+  prefs.putBool("anet_fb_web", artnetFallbackToWeb);
   prefs.putString("fw_tag",   FW_TAG);
   prefs.end();
 }
@@ -133,6 +149,8 @@ static void loadConfig() {
   netMode      = NetMode(prefs.getUChar("net_mode", uint8_t(netMode)));
   artOutEnabled = prefs.getBool("ao_en",     artOutEnabled);
   webEnabled   = prefs.getBool("web_en",     webEnabled);
+  burnSafeMode = prefs.getBool("burn_safe",  burnSafeMode);
+  artnetFallbackToWeb = prefs.getBool("anet_fb_web", artnetFallbackToWeb);
   String savedFwTag = prefs.getString("fw_tag", "");
   prefs.end();
   if (mode > MODE_HTP) mode = MODE_HTP;
@@ -189,6 +207,54 @@ struct GroupDef {
 static constexpr uint8_t MAX_GROUPS = 8;
 static GroupDef groups[MAX_GROUPS];
 
+struct FixtureDef {
+  char name[16];
+  uint16_t start; // 1-based DMX channel
+  uint16_t end;   // 1-based DMX channel
+  uint8_t x;      // 0..255 stage X position
+  uint8_t y;      // 0..255 stage Y position
+  bool enabled;
+};
+static FixtureDef fixtures[MAX_FIXTURES];
+static uint8_t fixtureCount = 4;
+
+static void initFixtureDefaults() {
+  const uint16_t starts[MAX_FIXTURES] = {1, 4, 7, 10, 64, 67, 70, 73, 128, 131, 134, 137};
+  const uint16_t ends[MAX_FIXTURES]   = {3, 6, 9, 12, 66, 69, 72, 75, 130, 133, 136, 139};
+  const uint8_t xs[MAX_FIXTURES] = {32, 96, 160, 224, 32, 96, 160, 224, 32, 96, 160, 224};
+  const uint8_t ys[MAX_FIXTURES] = {32, 32, 32, 32, 128, 128, 128, 128, 224, 224, 224, 224};
+  fixtureCount = 4;
+  for (uint8_t i = 0; i < MAX_FIXTURES; i++) {
+    snprintf(fixtures[i].name, sizeof(fixtures[i].name), "F%u", i + 1);
+    fixtures[i].start = starts[i];
+    fixtures[i].end = ends[i];
+    fixtures[i].x = xs[i];
+    fixtures[i].y = ys[i];
+    fixtures[i].enabled = (i < fixtureCount);
+  }
+}
+
+static void saveFixtures() {
+  prefs.begin("fixtures", false);
+  prefs.putUChar("count", fixtureCount);
+  prefs.putBytes("items", fixtures, sizeof(fixtures));
+  prefs.end();
+}
+
+static void loadFixtures() {
+  initFixtureDefaults();
+  prefs.begin("fixtures", true);
+  uint8_t count = prefs.getUChar("count", fixtureCount);
+  size_t got = prefs.getBytes("items", fixtures, sizeof(fixtures));
+  prefs.end();
+  if (got == sizeof(fixtures)) {
+    fixtureCount = constrain(count, uint8_t(1), MAX_FIXTURES);
+    for (uint8_t i = 0; i < MAX_FIXTURES; i++) fixtures[i].enabled = (i < fixtureCount) ? fixtures[i].enabled : false;
+  } else {
+    initFixtureDefaults();
+  }
+}
+
 struct CueStep {
   uint8_t scene;       // 0..7
   uint32_t dwellMs;    // hold time after fade
@@ -210,7 +276,8 @@ enum FxMode : uint8_t {
   FX_SPARKLE = 5,
   FX_COMET = 6,
   FX_BARS = 7,
-  FX_GLITCH = 8
+  FX_GLITCH = 8,
+  FX_RADAR = 9,
 };
 static FxMode fxMode = FX_NONE;
 static bool fxEnabled = false;
@@ -237,6 +304,7 @@ static SemaphoreHandle_t gLock;
 static volatile bool     pendingReboot        = false;
 static volatile bool     pendingWifiReconnect = false;
 static volatile bool     pendingWifiForget    = false;
+static volatile bool     pendingFactoryReset  = false;
 
 // ── Broadcast queue (web callbacks write, peer task drains) ───────────────────
 static constexpr uint8_t BCAST_CAP      = 8;
@@ -281,6 +349,37 @@ static void jsonEsc(char* dst, size_t n, const String& src) {
     }
   }
   dst[d] = '\0';
+}
+
+static uint8_t effectiveSafeMaxLevel() {
+  return burnSafeMode ? BURN_SAFE_MAX_LEVEL : SAFE_MAX_LEVEL;
+}
+
+static uint8_t effectiveSafeSlewStep() {
+  return burnSafeMode ? BURN_SAFE_SLEW_STEP : SAFE_SLEW_STEP;
+}
+
+static bool jsonAppend(char* buf, size_t n, int& pos, const char* fmt, ...) {
+  if (!buf || !n) return false;
+  if (pos < 0) pos = 0;
+  if (size_t(pos) >= n) {
+    pos = int(n);
+    return false;
+  }
+  va_list ap;
+  va_start(ap, fmt);
+  int written = vsnprintf(buf + pos, n - size_t(pos), fmt, ap);
+  va_end(ap);
+  if (written < 0) {
+    pos = int(n);
+    return false;
+  }
+  if (size_t(written) >= n - size_t(pos)) {
+    pos = int(n);
+    return false;
+  }
+  pos += written;
+  return true;
 }
 
 // Extract a quoted JSON string value for a given key (simple, no escape handling needed).
@@ -514,58 +613,61 @@ static void sendBeacon() {
 
 // Parse an incoming beacon UDP packet and update the peers table.
 static void pollDiscovery() {
-  int sz = discoverUdp.parsePacket();
-  if (sz <= 0) return;
   char buf[256];
-  int n = discoverUdp.read(buf, min(sz, (int)sizeof(buf) - 1));
-  if (n <= 0) return;
-  buf[n] = '\0';
-  if (!strstr(buf, "vizzz.di")) return;  // ignore non-vizzz packets
+  for (uint8_t processed = 0; processed < DISC_PKT_BUDGET; processed++) {
+    int sz = discoverUdp.parsePacket();
+    if (sz <= 0) break;
 
-  char pName[40], pIp[16], pIpJson[16], pMdns[48], pMac[18];
-  if (!jsonExtract(buf, "name", pName, sizeof(pName))) return;
-  if (!jsonExtract(buf, "ip",   pIpJson, sizeof(pIpJson))) return;
-  jsonExtract(buf, "mdns", pMdns, sizeof(pMdns));
-  pMac[0] = '\0';
-  jsonExtract(buf, "mac",  pMac,  sizeof(pMac));
-  ipToCStr(pIp, sizeof(pIp), discoverUdp.remoteIP());
+    int n = discoverUdp.read(buf, min(sz, (int)sizeof(buf) - 1));
+    if (n <= 0) continue;
+    buf[n] = '\0';
+    if (!strstr(buf, "vizzz.di")) continue;  // ignore non-vizzz packets
 
-  // Ignore our own beacon — compare by MAC (reliable) with IP fallback.
-  String ownMac = WiFi.macAddress();
-  if (pMac[0] != '\0') {
-    if (strcasecmp(pMac, ownMac.c_str()) == 0) return;
-  } else if (WiFi.status() == WL_CONNECTED) {
-    if (ipStr(WiFi.localIP()) == pIp) return;
-  }
+    char pName[40], pIp[16], pIpJson[16], pMdns[48], pMac[18];
+    if (!jsonExtract(buf, "name", pName, sizeof(pName))) continue;
+    if (!jsonExtract(buf, "ip",   pIpJson, sizeof(pIpJson))) continue;
+    jsonExtract(buf, "mdns", pMdns, sizeof(pMdns));
+    pMac[0] = '\0';
+    jsonExtract(buf, "mac",  pMac,  sizeof(pMac));
+    ipToCStr(pIp, sizeof(pIp), discoverUdp.remoteIP());
 
-  uint32_t now = millis();
-  if (xSemaphoreTake(gLock, pdMS_TO_TICKS(5)) != pdTRUE) return;
-
-  bool found = false;
-  for (uint8_t i = 0; i < peerCount; i++) {
-    // Match by MAC first (IP can change on DHCP rebind), fall back to IP.
-    bool match = (pMac[0] != '\0') ? (strcasecmp(peers[i].mac, pMac) == 0)
-                                   : (strcmp(peers[i].ip, pIp) == 0);
-    if (match) {
-      strlcpy(peers[i].name, pName, sizeof(peers[i].name));
-      strlcpy(peers[i].ip,   pIp,   sizeof(peers[i].ip));
-      strlcpy(peers[i].mdns, pMdns, sizeof(peers[i].mdns));
-      strlcpy(peers[i].mac,  pMac,  sizeof(peers[i].mac));
-      peers[i].lastSeenMs = now;
-      found = true;
-      break;
+    // Ignore our own beacon — compare by MAC (reliable) with IP fallback.
+    String ownMac = WiFi.macAddress();
+    if (pMac[0] != '\0') {
+      if (strcasecmp(pMac, ownMac.c_str()) == 0) continue;
+    } else if (WiFi.status() == WL_CONNECTED) {
+      if (ipStr(WiFi.localIP()) == pIp) continue;
     }
+
+    uint32_t now = millis();
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(5)) != pdTRUE) continue;
+
+    bool found = false;
+    for (uint8_t i = 0; i < peerCount; i++) {
+      // Match by MAC first (IP can change on DHCP rebind), fall back to IP.
+      bool match = (pMac[0] != '\0') ? (strcasecmp(peers[i].mac, pMac) == 0)
+                                     : (strcmp(peers[i].ip, pIp) == 0);
+      if (match) {
+        strlcpy(peers[i].name, pName, sizeof(peers[i].name));
+        strlcpy(peers[i].ip,   pIp,   sizeof(peers[i].ip));
+        strlcpy(peers[i].mdns, pMdns, sizeof(peers[i].mdns));
+        strlcpy(peers[i].mac,  pMac,  sizeof(peers[i].mac));
+        peers[i].lastSeenMs = now;
+        found = true;
+        break;
+      }
+    }
+    if (!found && peerCount < MAX_PEERS) {
+      strlcpy(peers[peerCount].name, pName, sizeof(peers[peerCount].name));
+      strlcpy(peers[peerCount].ip,   pIp,   sizeof(peers[peerCount].ip));
+      strlcpy(peers[peerCount].mdns, pMdns, sizeof(peers[peerCount].mdns));
+      strlcpy(peers[peerCount].mac,  pMac,  sizeof(peers[peerCount].mac));
+      peers[peerCount].lastSeenMs = now;
+      peerCount++;
+    }
+    xSemaphoreGive(gLock);
+    sendBeacon();  // reply so the other node also discovers us
   }
-  if (!found && peerCount < MAX_PEERS) {
-    strlcpy(peers[peerCount].name, pName, sizeof(peers[peerCount].name));
-    strlcpy(peers[peerCount].ip,   pIp,   sizeof(peers[peerCount].ip));
-    strlcpy(peers[peerCount].mdns, pMdns, sizeof(peers[peerCount].mdns));
-    strlcpy(peers[peerCount].mac,  pMac,  sizeof(peers[peerCount].mac));
-    peers[peerCount].lastSeenMs = now;
-    peerCount++;
-  }
-  xSemaphoreGive(gLock);
-  sendBeacon();  // reply so the other node also discovers us
 }
 
 // ── DMX ───────────────────────────────────────────────────────────────────────
@@ -604,15 +706,19 @@ static void refreshSacnSocket() {
 
 // ── Scenes ────────────────────────────────────────────────────────────────────
 static void loadScene(uint8_t n, uint8_t* dst) {
+  char key[4];
+  snprintf(key, sizeof(key), "s%u", n);
   prefs.begin("scenes", true);
-  size_t got = prefs.getBytes((String("s") + n).c_str(), dst, MAX_CH);
+  size_t got = prefs.getBytes(key, dst, MAX_CH);
   prefs.end();
   if (got != MAX_CH) memset(dst, 0, MAX_CH);
 }
 
 static void saveScene(uint8_t n, const uint8_t* src) {
+  char key[4];
+  snprintf(key, sizeof(key), "s%u", n);
   prefs.begin("scenes", false);
-  prefs.putBytes((String("s") + n).c_str(), src, MAX_CH);
+  prefs.putBytes(key, src, MAX_CH);
   prefs.end();
 }
 
@@ -653,6 +759,7 @@ static void initVjDefaults() {
     cueList[i].fadeMs = 500;
   }
   cueCount = 4;
+  initFixtureDefaults();
 }
 
 static void triggerCueStep(uint8_t idx) {
@@ -704,6 +811,16 @@ static uint8_t fxLaneForChannel(uint16_t ch, uint8_t lanes) {
   uint16_t laneSize = (MAX_CH + lanes - 1) / lanes;
   if (laneSize == 0) laneSize = 1;
   return min<uint8_t>(lanes - 1, uint8_t(ch / laneSize));
+}
+
+static const FixtureDef* fixtureForChannel(uint16_t ch) {
+  for (uint8_t i = 0; i < fixtureCount; i++) {
+    if (!fixtures[i].enabled) continue;
+    uint16_t s = constrain(fixtures[i].start, 1, MAX_CH);
+    uint16_t e = constrain(fixtures[i].end, s, MAX_CH);
+    if (ch + 1 >= s && ch + 1 <= e) return &fixtures[i];
+  }
+  return nullptr;
 }
 
 static uint32_t fxHash(uint32_t x) {
@@ -792,6 +909,20 @@ static uint8_t fxLevelForChannel(uint16_t ch, uint32_t now) {
     return fxApplyDepth(level);
   }
 
+  if (fxMode == FX_RADAR) {
+    const FixtureDef* fx = fixtureForChannel(ch);
+    if (!fx) return 255;
+    int dx = int(fx->x) - 128;
+    int dy = int(fx->y) - 128;
+    float ang = atan2f(float(dy), float(dx));
+    if (ang < 0.0f) ang += 6.2831853f;
+    float sweep = float(now % beatMs) / float(beatMs) * 6.2831853f;
+    float diff = fabsf(ang - sweep);
+    if (diff > 3.1415926f) diff = 6.2831853f - diff;
+    float level = 1.0f - min(1.0f, diff / 0.28f);
+    return fxApplyDepth(uint8_t(level * 255.0f));
+  }
+
   return 255;
 }
 
@@ -833,7 +964,9 @@ static bool oscReadFloat(const uint8_t* pkt, int n, int& off, float& out) {
 
 static void pollOsc() {
   uint8_t pkt[256];
-  for (int sz = oscUdp.parsePacket(); sz > 0; sz = oscUdp.parsePacket()) {
+  for (uint8_t processed = 0; processed < OSC_PKT_BUDGET; processed++) {
+    int sz = oscUdp.parsePacket();
+    if (sz <= 0) break;
     int n = oscUdp.read(pkt, min(int(sizeof(pkt)), sz));
     if (n < 8) continue;
 
@@ -864,9 +997,13 @@ static void pollOsc() {
     } else if (strncmp(addr, "/group/", 7) == 0) {
       int g = atoi(addr + 7);
       if (g >= 0 && g < MAX_GROUPS) {
-        uint16_t s = constrain(groups[g].start, 1, MAX_CH);
-        uint16_t e = constrain(groups[g].end, s, MAX_CH);
         if (xSemaphoreTake(gLock, pdMS_TO_TICKS(5)) == pdTRUE) {
+          if (!groups[g].enabled) {
+            xSemaphoreGive(gLock);
+            continue;
+          }
+          uint16_t s = constrain(groups[g].start, 1, MAX_CH);
+          uint16_t e = constrain(groups[g].end, s, MAX_CH);
           for (uint16_t ch = s; ch <= e; ch++) webVals[ch - 1] = uint8_t(constrain(v, 0, 255));
           xSemaphoreGive(gLock);
         }
@@ -894,7 +1031,7 @@ static void pollOsc() {
       }
     } else if (strcmp(addr, "/fx/mode") == 0) {
       if (xSemaphoreTake(gLock, pdMS_TO_TICKS(5)) == pdTRUE) {
-        fxMode = FxMode(constrain(v, 0, 8));
+        fxMode = FxMode(constrain(v, 0, 9));
         fxEnabled = (fxMode != FX_NONE);
         xSemaphoreGive(gLock);
       }
@@ -931,6 +1068,8 @@ static void pollOsc() {
 // ── Output ────────────────────────────────────────────────────────────────────
 static void computeOutput_locked(bool aActive, bool sActive, uint32_t nowMs) {
   bool netActive = aActive || sActive;
+  uint8_t ceiling = effectiveSafeMaxLevel();
+  uint8_t slewStep = effectiveSafeSlewStep();
 
   for (int i = 0; i < MAX_CH; i++) {
     uint8_t netIn = 0;
@@ -944,7 +1083,7 @@ static void computeOutput_locked(bool aActive, bool sActive, uint32_t nowMs) {
         v = webVals[i];
         break;
       case MODE_ARTNET:
-        v = netActive ? netIn : outVals[i];
+        v = netActive ? netIn : (artnetFallbackToWeb ? webVals[i] : outVals[i]);
         break;
       default: // MODE_HTP
         v = netActive ? max(webVals[i], netIn) : webVals[i];
@@ -952,8 +1091,10 @@ static void computeOutput_locked(bool aActive, bool sActive, uint32_t nowMs) {
     }
 
     if (masterDimmer < 255) v = vizzz::applyMaster(v, masterDimmer);
+    v = vizzz::clampLevel(v, ceiling);
     uint8_t fxLevel = fxLevelForChannel(i, nowMs);
-    outVals[i] = (fxLevel < 255) ? vizzz::applyMaster(v, fxLevel) : v;
+    uint8_t target = (fxLevel < 255) ? vizzz::applyMaster(v, fxLevel) : v;
+    outVals[i] = vizzz::slewToward(outVals[i], target, slewStep);
   }
   memcpy(dmxFrame + 1, outVals, MAX_CH);
 }
@@ -992,7 +1133,9 @@ static void pollArtNet() {
   uint8_t pkt[18 + MAX_CH];
   static const uint8_t artNetId[8] = {'A','r','t','-','N','e','t',0};
 
-  for (int size = artInUdp.parsePacket(); size > 0; size = artInUdp.parsePacket()) {
+  for (uint8_t processed = 0; processed < ARTNET_PKT_BUDGET; processed++) {
+    int size = artInUdp.parsePacket();
+    if (size <= 0) break;
     int n = artInUdp.read(pkt, min(int(sizeof(pkt)), size));
     if (n < 18) continue;
     if (memcmp(pkt, artNetId, sizeof(artNetId)) != 0) continue;
@@ -1015,7 +1158,9 @@ static void pollArtNet() {
 static void pollSacn() {
   uint8_t pkt[638]; // enough for E1.31 packet with full universe
 
-  for (int size = sacnUdp.parsePacket(); size > 0; size = sacnUdp.parsePacket()) {
+  for (uint8_t processed = 0; processed < SACN_PKT_BUDGET; processed++) {
+    int size = sacnUdp.parsePacket();
+    if (size <= 0) break;
     int n = sacnUdp.read(pkt, min(int(sizeof(pkt)), size));
     if (n < 126) continue;
 
@@ -1057,6 +1202,7 @@ static const char APP_HTML[] PROGMEM = R"HTML(<!doctype html><html lang="en">
 <style>
 :root{--di-cyan:#4df9ff;--di-cyan-dim:rgba(77,249,255,.1);--di-cyan-border:rgba(77,249,255,.3);--di-black:#000;--di-surface:#0a0a0a;--di-panel:#050505;--di-text:#fff;--di-muted:rgba(255,255,255,.45);--di-danger:#f25f5c;--di-mono:"JetBrains Mono","Fira Code","Consolas",monospace}
 *{box-sizing:border-box;margin:0;padding:0}
+.grid > *, .stack > *, .section > *, .card > *, .split > *, .triple > *, .sceneActions > *, .vjStrip > *, .sceneSlotGrid > *, .vjPadGrid > *, .vjFaders > *{min-width:0}
 body{font:14px/1.45 "Inter","Segoe UI",sans-serif;background:var(--di-black);color:var(--di-text);min-height:100vh}
 .shell{max-width:1080px;margin:0 auto;padding:10px}
 .hero{background:var(--di-surface);border:1px solid var(--di-cyan-border);border-radius:0;padding:10px;margin-bottom:10px}
@@ -1069,31 +1215,35 @@ body{font:14px/1.45 "Inter","Segoe UI",sans-serif;background:var(--di-black);col
 .tabs{display:flex;gap:6px;overflow-x:auto;margin-top:10px;padding-bottom:2px;-webkit-overflow-scrolling:touch}
 .tab{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;min-height:42px;padding:10px 12px;border-radius:0;border:1px solid var(--di-cyan-border);background:var(--di-black);color:var(--di-muted);text-decoration:none;font:700 .74rem/1 var(--di-mono);text-transform:uppercase;letter-spacing:.04em}
 .tab:hover,.tab.active{background:var(--di-cyan-dim);border-color:var(--di-cyan);color:var(--di-cyan)}
-.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
 .stack{display:grid;gap:10px}.section{display:none}.section.active{display:grid;gap:10px}
 .card{background:var(--di-surface);border:1px solid var(--di-cyan-border);border-radius:0;padding:10px}
 .card h2{font:700 .82rem/1.1 var(--di-mono);letter-spacing:.05em;text-transform:uppercase;margin-bottom:10px;color:var(--di-text)}.card h2:before{content:"□ ";color:var(--di-cyan)}.meta{display:none}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row+.row{margin-top:8px}
-.grow{flex:1 1 150px}.split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.triple{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.grow{flex:1 1 150px}.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.triple{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
 label{display:grid;gap:5px;font:700 .66rem/1 var(--di-mono);text-transform:uppercase;letter-spacing:.06em;color:var(--di-muted)}
 input,select,button,textarea{border-radius:0;border:1px solid var(--di-cyan-border);min-height:44px;padding:10px;background:var(--di-black);color:var(--di-text);font:600 .9rem/1.2 "Inter","Segoe UI",sans-serif;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--di-cyan);box-shadow:0 0 0 1px var(--di-cyan)}
-button{cursor:pointer;background:var(--di-cyan-dim);border-color:var(--di-cyan);color:var(--di-cyan);font-weight:800;text-transform:uppercase;letter-spacing:.04em}
+button{cursor:pointer;background:var(--di-cyan-dim);border-color:var(--di-cyan);color:var(--di-cyan);font-weight:800;text-transform:uppercase;letter-spacing:.02em;white-space:normal;word-break:break-word;overflow-wrap:anywhere;line-height:1.15;text-align:center}
 button:hover,button.active{background:rgba(77,249,255,.16)}button.alt{background:var(--di-black);border-color:var(--di-cyan-border);color:var(--di-text)}button.alt.active{border-color:var(--di-cyan);color:var(--di-cyan);background:var(--di-cyan-dim)}button.good,button.bad{background:var(--di-cyan-dim);border-color:var(--di-cyan);color:var(--di-cyan)}
 button.wide{width:100%}.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .heroMeter{padding:12px;border-radius:0;background:var(--di-black);border:1px solid var(--di-cyan-border);color:var(--di-text);text-align:center}.heroMeter .big{font:700 2rem/1 var(--di-mono);color:var(--di-cyan)}
 .sceneGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.sceneBtn{height:68px;font-size:.9rem}.miniScene{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
-.patchHead{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.channels{display:grid;grid-template-columns:52px 1fr 38px 38px;gap:7px;align-items:center}
+.sceneCoach{border:1px solid var(--di-cyan-border);background:var(--di-black);padding:10px;font:700 .72rem/1.35 var(--di-mono);color:var(--di-muted);text-transform:uppercase;letter-spacing:.03em}
+.sceneBigRead{margin-top:8px;padding:12px;border:1px solid var(--di-cyan);background:var(--di-cyan-dim);font:800 1.4rem/1 var(--di-mono);color:var(--di-cyan);text-align:center}
+.sceneSlotGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin-top:10px}.sceneSlotBtn{min-height:64px;font:800 1.05rem/1 var(--di-mono)}
+.sceneActions{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:10px}
+.patchHead{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.patchGrid{display:grid;grid-template-columns:minmax(260px,1.3fr) minmax(240px,.7fr);gap:10px}.stageCanvas{position:relative;min-height:320px;border:1px solid var(--di-cyan-border);background:radial-gradient(circle at 50% 50%, rgba(77,249,255,.08), transparent 45%), linear-gradient(90deg, rgba(77,249,255,.06) 1px, transparent 1px), linear-gradient(rgba(77,249,255,.06) 1px, transparent 1px);background-size:100% 100%, 25% 100%, 100% 25%;overflow:hidden}.fixtureDot{position:absolute;transform:translate(-50%,-50%);min-width:72px;min-height:42px;padding:4px 6px;border-radius:0;border:1px solid var(--di-cyan-border);background:rgba(0,0,0,.88);color:var(--di-text);font:700 .62rem/1 var(--di-mono);text-transform:uppercase;letter-spacing:.04em}.fixtureDot.active{border-color:var(--di-cyan);background:var(--di-cyan-dim);color:var(--di-cyan)}.fixtureList{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}.fixtureCard{border:1px solid var(--di-cyan-border);background:var(--di-black);padding:8px;display:grid;gap:8px}.fixtureCard b{font:800 .75rem/1 var(--di-mono)}.fixtureCard span{font:600 .6rem/1.2 var(--di-mono);color:var(--di-muted)}.channels{display:grid;grid-template-columns:52px 1fr 38px 38px;gap:7px;align-items:center}
 .chLabel{font:700 .68rem/1 var(--di-mono);color:var(--di-muted);letter-spacing:.02em}.outVal{font:700 .72rem/1 var(--di-mono);text-align:right;color:var(--di-muted)}.outVal.hot{color:var(--di-cyan)}.webVal{font:700 .72rem/1 var(--di-mono);text-align:right}
 input[type=range]{width:100%;accent-color:var(--di-cyan)}
 .nets{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.net{padding:9px;border-radius:0;border:1px solid var(--di-cyan-border);background:var(--di-black);cursor:pointer;font-size:.8rem;text-align:left;overflow:hidden;text-overflow:ellipsis}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--di-black);border:1px solid var(--di-cyan-border);border-radius:0;padding:10px;font:11px/1.4 var(--di-mono);max-height:260px;overflow:auto;color:var(--di-text)}
 .footerNote{font:600 .7rem/1.35 var(--di-mono);color:var(--di-muted);letter-spacing:.02em}
-.vjStatus{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.vjReadout{border:1px solid var(--di-cyan-border);background:var(--di-black);padding:10px;min-height:64px}.vjReadout b{display:block;font:800 1.25rem/1 var(--di-mono);color:var(--di-cyan)}.vjReadout span{display:block;margin-top:6px;font:700 .62rem/1 var(--di-mono);text-transform:uppercase;letter-spacing:.05em;color:var(--di-muted)}
-.vjPadGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.vjPad{min-height:66px;text-align:left;display:grid;align-content:center;gap:4px;touch-action:manipulation}.vjPad b{display:block;font:800 1.05rem/1 var(--di-mono);color:inherit}.vjPad span{display:block;font:700 .58rem/1 var(--di-mono);color:var(--di-muted);letter-spacing:.04em;text-transform:uppercase}.vjPad.active{background:var(--di-cyan-dim);border-color:var(--di-cyan);color:var(--di-cyan)}
-.vjStrip{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.vjStrip button{min-height:54px}.vjFaders{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.groupTile{border:1px solid var(--di-cyan-border);background:var(--di-black);padding:8px;display:grid;gap:8px;min-width:0}.groupTile .top{display:flex;justify-content:space-between;gap:6px;align-items:flex-start}.groupTile b{font:800 .78rem/1 var(--di-mono);color:var(--di-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.groupTile span{font:700 .58rem/1 var(--di-mono);color:var(--di-muted)}.groupTile input{min-height:38px;padding:0}.groupTile .miniActions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.groupTile button{min-height:34px;padding:6px;font-size:.64rem}
-.swatches{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.swatch{min-height:44px;border:1px solid var(--di-cyan-border);color:#fff;text-shadow:0 1px 1px #000;font:800 .62rem/1 var(--di-mono);text-transform:uppercase}.swatch.cyan{background:#00484d}.swatch.mag{background:#4a004d}.swatch.amber{background:#4d2a00}.swatch.red{background:#4d0000}.swatch.green{background:#004d18}.swatch.blue{background:#001f4d}.swatch.white{background:#eee;color:#000;text-shadow:none}.swatch.black{background:#000;color:var(--di-muted)}
-@media (max-width:760px){body{font-size:13px}.shell{padding:6px}.hero{padding:8px;margin-bottom:8px}.brand{display:block}.pillbar{overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}.pill{flex:0 0 auto}.grid,.split,.triple,.vjStatus{grid-template-columns:1fr}.section.active,.stack{gap:8px}.card{padding:9px}.actions,.vjStrip{grid-template-columns:1fr}.sceneGrid,.miniScene,.vjPadGrid,.vjFaders,.swatches{grid-template-columns:repeat(2,minmax(0,1fr))}.channels{grid-template-columns:42px 1fr 32px 32px;gap:6px}.chLabel{font-size:.62rem}.footerNote{margin-top:6px}.heroMeter .big{font-size:1.7rem}.vjPad{min-height:62px}.vjReadout{min-height:54px}}
+.vjStatus{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.vjReadout{border:1px solid var(--di-cyan-border);background:var(--di-black);padding:10px;min-height:64px}.vjReadout b{display:block;font:800 1.25rem/1 var(--di-mono);color:var(--di-cyan)}.vjReadout span{display:block;margin-top:6px;font:700 .62rem/1 var(--di-mono);text-transform:uppercase;letter-spacing:.05em;color:var(--di-muted)}
+.vjPadGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px}.vjPad{min-height:66px;text-align:left;display:grid;align-content:center;gap:4px;touch-action:manipulation}.vjPad b{display:block;font:800 1.05rem/1 var(--di-mono);color:inherit}.vjPad span{display:block;font:700 .58rem/1 var(--di-mono);color:var(--di-muted);letter-spacing:.04em;text-transform:uppercase}.vjPad.active{background:var(--di-cyan-dim);border-color:var(--di-cyan);color:var(--di-cyan)}
+.vjStrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}.vjStrip button{min-height:54px}.vjFaders{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.groupTile{border:1px solid var(--di-cyan-border);background:var(--di-black);padding:8px;display:grid;gap:8px;min-width:0}.groupTile .top{display:flex;justify-content:space-between;gap:6px;align-items:flex-start}.groupTile b{font:800 .78rem/1 var(--di-mono);color:var(--di-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.groupTile span{font:700 .58rem/1 var(--di-mono);color:var(--di-muted)}.groupTile input{min-height:38px;padding:0}.groupTile .miniActions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.groupTile button{min-height:34px;padding:6px;font-size:.64rem}
+.swatches{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px}.swatch{min-height:44px;border:1px solid var(--di-cyan-border);color:#fff;text-shadow:0 1px 1px #000;font:800 .62rem/1 var(--di-mono);text-transform:uppercase}.swatch.cyan{background:#00484d}.swatch.mag{background:#4a004d}.swatch.amber{background:#4d2a00}.swatch.red{background:#4d0000}.swatch.green{background:#004d18}.swatch.blue{background:#001f4d}.swatch.white{background:#eee;color:#000;text-shadow:none}.swatch.black{background:#000;color:var(--di-muted)}
+@media (max-width:760px){body{font-size:13px}.shell{padding:6px}.hero{padding:8px;margin-bottom:8px}.brand{display:block}.pillbar{overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}.pill{flex:0 0 auto}.grid,.split,.triple,.vjStatus{grid-template-columns:1fr}.section.active,.stack{gap:8px}.card{padding:9px}.actions,.vjStrip,.sceneActions{grid-template-columns:1fr}.sceneGrid,.miniScene,.sceneSlotGrid,.vjPadGrid,.vjFaders,.swatches{grid-template-columns:repeat(2,minmax(0,1fr))}.channels{grid-template-columns:42px 1fr 32px 32px;gap:6px}.chLabel{font-size:.62rem}.footerNote{margin-top:6px}.heroMeter .big{font-size:1.7rem}.vjPad{min-height:62px}.vjReadout{min-height:54px}}
 </style>
 </head>
 <body>
@@ -1119,7 +1269,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--di-black);border
     <nav class="tabs" id="tabs">
       <a class="tab" data-route="/control" href="/control">Control</a>
       <a class="tab" data-route="/patch" href="/patch">Patch</a>
-      <a class="tab" data-route="/scenes" href="/scenes">Scenes</a>
+      <a class="tab" data-route="/vj" href="/vj">Performance</a>
       <a class="tab" data-route="/network" href="/network">WiFi</a>
       <a class="tab" data-route="/system" href="/system">System</a>
       <a class="tab" data-route="/vj" href="/vj">VJ</a>
@@ -1159,7 +1309,51 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--di-black);border
   </section>
 
   <section class="section" data-route="/patch">
-    <div class="card">
+    <div class="grid">
+      <div class="card">
+        <div class="patchHead">
+          <div>
+            <h2>Stage Patch</h2>
+            <div class="meta">Place fixtures on the stage, assign DMX ranges, and save positions for visual effects.</div>
+          </div>
+          <div class="row">
+            <label>Selected<input id="fixtureSel" type="number" min="0" max="11" value="0"></label>
+            <button class="alt" onclick="loadFixtures()">Refresh</button>
+          </div>
+        </div>
+        <div class="stageCanvas" id="stageCanvas"></div>
+        <div class="fixtureList" id="fixtureList"></div>
+      </div>
+      <div class="card">
+        <h2>Fixture Editor</h2>
+        <div class="split">
+          <label>Name<input id="fxName" value="F1"></label>
+          <label>Count<input id="fxCount" type="number" min="1" max="12" value="4"></label>
+        </div>
+        <div class="split" style="margin-top:8px">
+          <label>Start Ch<input id="fxStart" type="number" min="1" max="512" value="1"></label>
+          <label>End Ch<input id="fxEnd" type="number" min="1" max="512" value="3"></label>
+        </div>
+        <div class="split" style="margin-top:8px">
+          <label>X<input id="fxX" type="range" min="0" max="255" value="32" oninput="$('fxXLabel').textContent=this.value"></label>
+          <label>Y<input id="fxY" type="range" min="0" max="255" value="32" oninput="$('fxYLabel').textContent=this.value"></label>
+        </div>
+        <div class="row" style="margin-top:8px"><div class="footerNote">X <span id="fxXLabel">32</span> · Y <span id="fxYLabel">32</span></div></div>
+        <div class="row" style="margin-top:8px"><label><input id="fxEn" type="checkbox" checked style="min-height:auto;align-self:center"> Enabled</label></div>
+        <div class="vjStrip" style="margin-top:8px">
+          <button onclick="saveFixture()">Save Fixture</button>
+          <button class="alt" onclick="fixturePrev()">Prev</button>
+          <button class="alt" onclick="fixtureNext()">Next</button>
+        </div>
+        <div class="vjStrip" style="margin-top:8px">
+          <button class="alt" onclick="applyRadarPreset()">Radar Preset</button>
+          <button class="alt" onclick="applyThunder6Mode()">THUNDER 6</button>
+          <button class="alt" onclick="setMode(2)">HTP Mode</button>
+          <button class="alt" onclick="setMode(0)">Web Mode</button>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:10px">
       <div class="patchHead">
         <div>
           <h2>Channel Patch</h2>
@@ -1171,22 +1365,6 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--di-black);border
         </div>
       </div>
       <div class="channels" id="channels"></div>
-    </div>
-  </section>
-
-  <section class="section" data-route="/scenes">
-    <div class="grid">
-      <div class="card">
-        <h2>Recall</h2>
-        <div class="meta">Performance-safe scene recalls with fade time.</div>
-        <div class="row"><label class="grow">Fade ms<input id="fadeInput" type="number" value="1000"></label></div>
-        <div class="sceneGrid" id="sceneRecall"></div>
-      </div>
-      <div class="card">
-        <h2>Store</h2>
-        <div class="meta">Write current web layer into scene memory.</div>
-        <div class="miniScene" id="sceneSave"></div>
-      </div>
     </div>
   </section>
 
@@ -1295,19 +1473,33 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--di-black);border
 
       <div class="grid">
         <div class="card">
-          <h2>Scene Launcher</h2>
-          <div class="row"><label class="grow">Fade ms<input id="perfFade" type="number" value="1000"></label></div>
-          <div class="vjPadGrid" id="vjScenes" style="margin-top:10px"></div>
-          <div class="vjStrip" style="margin-top:10px">
-            <button class="alt" onclick="saveScene(0)">Save 1</button>
-            <button class="alt" onclick="saveScene(1)">Save 2</button>
-            <button class="alt" onclick="saveScene(2)">Save 3</button>
+          <h2>Easy Scenes</h2>
+          <div class="sceneCoach">1. Tap a scene number.<br>2. Press Save to remember your current lights.<br>3. Press Play to show that scene.</div>
+          <div class="sceneBigRead" id="sceneSlotRead">Scene 1 ready</div>
+          <div class="sceneSlotGrid" id="vjScenes"></div>
+          <div class="row" style="margin-top:10px"><label class="grow">Scene Change Speed (ms)<input id="perfFade" type="number" value="800"></label></div>
+          <div class="vjStrip" style="margin-top:8px">
+            <button class="alt" onclick="setSceneFade(0)">Instant</button>
+            <button class="alt" onclick="setSceneFade(800)">Soft</button>
+            <button class="alt" onclick="setSceneFade(1500)">Slow</button>
           </div>
+          <div class="sceneActions">
+            <button onclick="sceneSaveSelected()">Save This Look</button>
+            <button class="good" onclick="scenePlaySelected()">Play This Scene</button>
+            <button class="alt" onclick="sceneSelectNext()">Next Scene</button>
+            <button class="alt" onclick="sceneSaveAndNext()">Save + Next</button>
+          </div>
+          <div class="vjStrip" style="margin-top:8px">
+            <button class="alt" onclick="applyThunder6Mode()">THUNDER 6 Electro Mode</button>
+            <button class="alt" id="ugModeBtn" onclick="toggleUndergroundMode()">Underground Colors ON</button>
+            <button class="alt" onclick="applyUndergroundLook()">Apply Underground Look</button>
+          </div>
+          <div class="footerNote" id="sceneActionText" style="margin-top:8px">Tip: build scenes from 1 to 8.</div>
         </div>
 
         <div class="card">
           <h2>FX Engine</h2>
-          <select id="fxModeSel" style="display:none"><option value="none">none</option><option value="strobe">strobe</option><option value="chase">chase</option><option value="pulse">pulse</option><option value="sine">sine</option><option value="sparkle">sparkle</option><option value="comet">comet</option><option value="bars">bars</option><option value="glitch">glitch</option></select>
+          <select id="fxModeSel" style="display:none"><option value="none">none</option><option value="strobe">strobe</option><option value="chase">chase</option><option value="pulse">pulse</option><option value="sine">sine</option><option value="sparkle">sparkle</option><option value="comet">comet</option><option value="bars">bars</option><option value="glitch">glitch</option><option value="radar">radar</option></select>
           <div class="vjPadGrid">
             <button class="vjPad" data-fx="none" onclick="fxMode('none')"><b>OFF</b><span>fx</span></button>
             <button class="vjPad" data-fx="strobe" onclick="fxMode('strobe')"><b>STRB</b><span>fx</span></button>
@@ -1318,6 +1510,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--di-black);border
             <button class="vjPad" data-fx="comet" onclick="fxMode('comet')"><b>COMT</b><span>fx</span></button>
             <button class="vjPad" data-fx="bars" onclick="fxMode('bars')"><b>BARS</b><span>fx</span></button>
             <button class="vjPad" data-fx="glitch" onclick="fxMode('glitch')"><b>GLCH</b><span>fx</span></button>
+            <button class="vjPad" data-fx="radar" onclick="fxMode('radar')"><b>RADR</b><span>fx</span></button>
             <button class="vjPad" onclick="bpmStep(.5)"><b>1/2</b><span>bpm</span></button>
             <button class="vjPad" onclick="bpmStep(2)"><b>2X</b><span>bpm</span></button>
           </div>
@@ -1414,21 +1607,65 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--di-black);border
 
 <script>
 const $=id=>document.getElementById(id);
-const route=location.pathname==='/performance'?'/vj':(location.pathname==='/'?'/control':location.pathname);
-let state=null,pageWeb=[],pageOut=[],curPage=0,masterTimer=null,scanTimer=null,artOutEnabled=false,webEnabled=true,vjTimer=null,colorTimer=null,vjGroups=[],groupTimers={},groupSig='';
+const route=(location.pathname==='/performance'||location.pathname==='/scenes')?'/vj':(location.pathname==='/'?'/control':location.pathname);
+let state=null,pageWeb=[],pageOut=[],curPage=0,masterTimer=null,scanTimer=null,artOutEnabled=false,webEnabled=true,vjTimer=null,colorTimer=null,vjGroups=[],groupTimers={},groupSig='',pagePollTimer=null,fleetTimer=null,fixtureTimer=null,fixtures=[],fixtureSel=0;
+let quickSceneSlot=0;
+let undergroundMode=true;
 
 function escHtml(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function escJsSq(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n').replace(/\r/g,'\\r');}
 function qs(url){return fetch(url,{cache:'no-store'}).then(r=>r.json()).catch(()=>null);}
 function hit(url){return fetch(url,{cache:'no-store'});}
+function hitWait(url){return fetch(url,{cache:'no-store'});}
 function setActiveRoute(){document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.dataset.route===route));document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.route===route));}
 function makeScenes(){
-  $('sceneRecall').innerHTML=[...Array(8)].map((_,i)=>`<button class="sceneBtn" onclick="recallScene(${i})">Recall ${i+1}</button>`).join('');
-  $('sceneSave').innerHTML=[...Array(8)].map((_,i)=>`<button onclick="saveScene(${i})">Save ${i+1}</button>`).join('');
-  $('vjScenes').innerHTML=[...Array(8)].map((_,i)=>`<button class="vjPad" onclick="recallPerf(${i})"><b>${i+1}</b><span>scene</span></button>`).join('');
+  $('vjScenes').innerHTML=[...Array(8)].map((_,i)=>`<button class="sceneSlotBtn" data-scene-slot="${i}" onclick="scenePick(${i})">${i+1}</button>`).join('');
   $('netScenes').innerHTML=[...Array(8)].map((_,i)=>`<button class="sceneBtn" onclick="netRecall(${i})">Scene ${i+1}</button>`).join('');
+  renderQuickSceneState();
 }
 function makePages(){ $('pageSel').innerHTML=[...Array(16)].map((_,i)=>`<option value="${i}">Page ${i+1}</option>`).join(''); }
+function clampFixtureIndex(i){return Math.max(0,Math.min(11,i|0));}
+function fixtureRow(f,i){return `<div class="fixtureCard${i===fixtureSel?' active':''}" onclick="selectFixture(${i})"><b>${escHtml(f.name||('F'+(i+1)))}</b><span>Ch ${f.start}-${f.end} · X ${f.x} · Y ${f.y}</span></div>`;}
+function syncFixtureEditor(){const f=fixtures[fixtureSel]||{name:'F'+(fixtureSel+1),start:1,end:3,x:32,y:32,enabled:true}; $('fixtureSel').value=fixtureSel; $('fxName').value=f.name||('F'+(fixtureSel+1)); $('fxCount').value=Math.max(1,Math.min(12,fixtures.length||4)); $('fxStart').value=f.start||1; $('fxEnd').value=f.end||1; $('fxX').value=f.x??32; $('fxY').value=f.y??32; $('fxXLabel').textContent=String(f.x??32); $('fxYLabel').textContent=String(f.y??32); $('fxEn').checked=!!f.enabled;}
+function renderFixtures(){const stage=$('stageCanvas'); const list=$('fixtureList'); if(!stage||!list) return; const count=Math.max(1,Math.min(12,fixtures.length||4)); stage.innerHTML=fixtures.slice(0,count).map((f,i)=>`<button class="fixtureDot${i===fixtureSel?' active':''}" style="left:${f.x}%;top:${f.y}%" onclick="selectFixture(${i})">${escHtml(f.name||('F'+(i+1)))}<br><span>Ch ${f.start}-${f.end}</span></button>`).join('')||'<div class="footerNote" style="padding:10px">No fixtures loaded</div>'; list.innerHTML=fixtures.slice(0,count).map((f,i)=>fixtureRow(f,i)).join('');}
+function selectFixture(i){fixtureSel=clampFixtureIndex(i); syncFixtureEditor(); renderFixtures();}
+function fixturePrev(){selectFixture(fixtureSel-1);}
+function fixtureNext(){selectFixture(fixtureSel+1);}
+function applyRadarPreset(){fxMode('radar'); setMode(2);}
+function setUndergroundModeUI(){
+  if($('ugModeBtn')) $('ugModeBtn').textContent='Underground Colors '+(undergroundMode?'ON':'OFF');
+}
+function toggleUndergroundMode(){
+  undergroundMode=!undergroundMode;
+  setUndergroundModeUI();
+  if($('sceneActionText')) $('sceneActionText').textContent='Underground color guard is '+(undergroundMode?'ON':'OFF')+'.';
+}
+async function applyThunder6Mode(){
+  const setup=[
+    {name:'TW1',start:1,end:3,x:24,y:42,en:1},
+    {name:'TW2',start:4,end:6,x:56,y:42,en:1},
+    {name:'TW3',start:7,end:9,x:88,y:42,en:1},
+    {name:'TW4',start:10,end:12,x:24,y:76,en:1},
+    {name:'TW5',start:13,end:15,x:56,y:76,en:1},
+    {name:'TW6',start:16,end:18,x:88,y:76,en:1}
+  ];
+  for(let i=0;i<setup.length;i++){
+    const f=setup[i];
+    const q=new URLSearchParams({i:String(i),count:'6',name:f.name,start:String(f.start),end:String(f.end),x:String(f.x),y:String(f.y),en:String(f.en)});
+    await hitWait('/fixture/set?'+q.toString());
+  }
+  await loadFixtures();
+  undergroundMode=true;
+  setUndergroundModeUI();
+  setMode(2);
+  $('fxBpm').value=124;
+  $('fxDepth').value=150;
+  fxMode('radar');
+  applyUndergroundLook();
+  if($('sceneActionText')) $('sceneActionText').textContent='THUNDER 6 mode ready: 6 fixtures patched for dark electro.';
+}
+async function loadFixtures(){const r=await qs('/fixtures'); if(!r) return; fixtures=r.fixtures||[]; if(fixtures.length===0) fixtures=[{name:'F1',start:1,end:3,x:32,y:32,enabled:true}]; fixtureSel=clampFixtureIndex(Math.min(fixtureSel, fixtures.length-1)); syncFixtureEditor(); renderFixtures();}
+function saveFixture(){const i=clampFixtureIndex($('fixtureSel').value); const p=new URLSearchParams(); p.append('i',i); p.append('name',$('fxName').value.trim()||('F'+(i+1))); p.append('count',String(Math.max(1,Math.min(12,+$('fxCount').value||fixtures.length||4)))); p.append('start',String(Math.max(1,+$('fxStart').value||1))); p.append('end',String(Math.max(1,+$('fxEnd').value||1))); p.append('x',String(Math.max(0,Math.min(255,+$('fxX').value||0)))); p.append('y',String(Math.max(0,Math.min(255,+$('fxY').value||0)))); p.append('en',$('fxEn').checked?1:0); hit('/fixture/set?'+p.toString()).then(()=>loadFixtures());}
 function updateMasterDisplays(v){const pct=Math.round((v/255)*100);$('masterPct').textContent=pct+'%';$('perfPct').textContent=pct+'%';$('vjMasterPct').textContent=pct+'%';if(document.activeElement!==$('master'))$('master').value=v;if(document.activeElement!==$('perfMaster'))$('perfMaster').value=v;}
 function updatePills(s){
   $('apIp').textContent=s.ip||'-'; $('aoTarget').textContent=s.ao_target||'-'; if(s.mdns) $('mdnsLabel').textContent=s.mdns+'.local';
@@ -1438,14 +1675,20 @@ function updatePills(s){
   const pc=s.peer_count||0; set('peersPill',pc+(pc===1?' peer':' peers'),pc>0,false);
 }
 function syncFields(s){
-  $('modeSel').value=String(s.mode); $('netModeSel').value=String(s.net_mode); $('netInput').value=s.net; $('subInput').value=s.subnet; $('uniInput').value=s.uni; $('uni15').textContent='15-bit: '+s.uni15; $('statusDump').textContent=JSON.stringify(s,null,2); $('diagDump').textContent=`mode=${s.mode_name}\nnetwork=${s.net_mode_name}\nartnet=${s.artnet_active}\nsacn=${s.sacn_active}\nweb=${s.web}\nout_target=${s.ao_target}`;
+  $('modeSel').value=String(s.mode); $('netModeSel').value=String(s.net_mode); $('netInput').value=s.net; $('subInput').value=s.subnet; $('uniInput').value=s.uni; $('uni15').textContent='15-bit: '+s.uni15;
+  if(route==='/control') $('statusDump').textContent=JSON.stringify(s,null,2);
+  if(route==='/system') $('diagDump').textContent=`mode=${s.mode_name}\nnetwork=${s.net_mode_name}\nartnet=${s.artnet_active}\nsacn=${s.sacn_active}\nweb=${s.web}\nout_target=${s.ao_target}`;
   artOutEnabled=!!s.ao; webEnabled=!!s.web; $('aoBtn').textContent='Art OUT '+(artOutEnabled?'ON':'OFF'); $('webBtn').textContent='Web '+(webEnabled?'ON':'OFF');
   if(!$('staSsid').value && s.sta_ssid) $('staSsid').placeholder=s.sta_ssid; if(!$('nodeName').value) $('nodeName').placeholder=s.name; if(!$('apSsid').value) $('apSsid').placeholder=s.ssid; updateMasterDisplays(s.dim||255);
-  $('vjModeRead').textContent=(s.mode_name||'').replace('_ONLY',''); $('vjFxRead').textContent=(document.querySelector('[data-fx].active')?.dataset.fx)||'none';
-  $('vjModeWeb').classList.toggle('active',s.mode===0); $('vjModeArt').classList.toggle('active',s.mode===1); $('vjModeHtp').classList.toggle('active',s.mode===2);
+  if(route==='/vj'){
+    $('vjModeRead').textContent=(s.mode_name||'').replace('_ONLY',''); $('vjFxRead').textContent=(document.querySelector('[data-fx].active')?.dataset.fx)||'none';
+    $('vjModeWeb').classList.toggle('active',s.mode===0); $('vjModeArt').classList.toggle('active',s.mode===1); $('vjModeHtp').classList.toggle('active',s.mode===2);
+  }
   const rssiLabel=s.sta_connected&&s.sta_rssi?(' \u00b7 '+s.sta_rssi+'dBm'):'';
-  if($('wsAP'))$('wsAP').textContent='AP: '+escHtml(s.ssid||'?')+' \u00b7 '+s.ip+' \u00b7 '+(s.ap_clients||0)+' client'+(s.ap_clients===1?'':'s');
-  if($('wsSTA'))$('wsSTA').textContent=s.sta_connected?('STA \u2713 '+(s.sta_ssid||'')+' \u00b7 '+s.sta_ip+rssiLabel):s.sta_ssid?('STA \u2192 '+(s.sta_ssid||'')+'\u2026'):'STA idle';
+  if(route==='/network'){
+    if($('wsAP'))$('wsAP').textContent='AP: '+escHtml(s.ssid||'?')+' \u00b7 '+s.ip+' \u00b7 '+(s.ap_clients||0)+' client'+(s.ap_clients===1?'':'s');
+    if($('wsSTA'))$('wsSTA').textContent=s.sta_connected?('STA \u2713 '+(s.sta_ssid||'')+' \u00b7 '+s.sta_ip+rssiLabel):s.sta_ssid?('STA \u2192 '+(s.sta_ssid||'')+'\u2026'):'STA idle';
+  }
 }
 function renderChannels(base){$('channels').innerHTML=[...Array(32)].map((_,i)=>{const ch=base+i,w=pageWeb[i]??0,o=pageOut[i]??0;return `<div class="chLabel">Ch ${ch}</div><input type="range" min="0" max="255" value="${w}" oninput="setChannel(${ch},+this.value);this.nextElementSibling.textContent=this.value"><div class="webVal">${w}</div><div class="outVal${o>w?' hot':''}">${o}</div>`;}).join('');}
 async function loadPage(){const s=await qs('/page?i='+curPage);if(!s)return;pageWeb=s.web||[];pageOut=s.out||[];$('pageInfo').textContent='ch '+s.base_ch+'-'+(s.base_ch+31);renderChannels(s.base_ch);}
@@ -1454,9 +1697,22 @@ function setChannel(ch,v){hit('/set?ch='+ch+'&v='+v);}
 function blackout(){hit('/blackout');}
 function fullOn(){hit('/full');}
 function queueMaster(v){updateMasterDisplays(v); clearTimeout(masterTimer); masterTimer=setTimeout(()=>hit('/master?v='+v),40);}
-function recallScene(i){hit('/scene/recall?n='+i+'&fade='+(+$('fadeInput').value||0));}
-function recallPerf(i){hit('/scene/recall?n='+i+'&fade='+(+$('perfFade').value||0));}
+function recallScene(i,fade){hit('/scene/recall?n='+i+'&fade='+(+fade||0));}
 function saveScene(i){hit('/scene/save?n='+i);}
+function renderQuickSceneState(){
+  document.querySelectorAll('[data-scene-slot]').forEach(b=>{
+    const idx=+(b.dataset.sceneSlot||0);
+    b.classList.toggle('active',idx===quickSceneSlot);
+  });
+  if($('sceneSlotRead')) $('sceneSlotRead').textContent='Scene '+(quickSceneSlot+1)+' ready';
+}
+function selectQuickScene(i){quickSceneSlot=Math.max(0,Math.min(7,i|0));renderQuickSceneState();}
+function scenePick(i){selectQuickScene(i);if($('sceneActionText')) $('sceneActionText').textContent='Scene '+(i+1)+' selected. Press Play to use it.';}
+function setSceneFade(ms){$('perfFade').value=ms; if($('sceneActionText')) $('sceneActionText').textContent='Scene change speed set to '+ms+' ms.';}
+function scenePlaySelected(){recallScene(quickSceneSlot,+($('perfFade').value||0)); if($('sceneActionText')) $('sceneActionText').textContent='Playing scene '+(quickSceneSlot+1)+'.';}
+function sceneSaveSelected(){saveScene(quickSceneSlot); if($('sceneActionText')) $('sceneActionText').textContent='Saved current lights to scene '+(quickSceneSlot+1)+'.';}
+function sceneSelectNext(){selectQuickScene((quickSceneSlot+1)%8); if($('sceneActionText')) $('sceneActionText').textContent='Moved to scene '+(quickSceneSlot+1)+'.';}
+function sceneSaveAndNext(){sceneSaveSelected(); sceneSelectNext();}
 function saveUniverse(){hit(`/artnet/set?net=${$('netInput').value}&subnet=${$('subInput').value}&uni=${$('uniInput').value}`);}
 function toggleArtOut(){artOutEnabled=!artOutEnabled; hit('/artout/set?en='+(artOutEnabled?1:0)); $('aoBtn').textContent='Art OUT '+(artOutEnabled?'ON':'OFF');}
 function toggleWeb(){const next=webEnabled?0:1; if(confirm('This will reboot the device. Continue?')) hit('/web/set?en='+next);}
@@ -1486,8 +1742,15 @@ function killFx(){$('fxModeSel').value='none';markFx('none');hit('/fx/set?en=0&m
 function colorLabel(){const r=+$('colorR').value||0,g=+$('colorG').value||0,b=+$('colorB').value||0;$('colorLabel').textContent='rgb '+r+' / '+g+' / '+b;}
 function queueColor(){colorLabel();$('colorEn').checked=true;clearTimeout(colorTimer);colorTimer=setTimeout(applyColor,55);}
 function applyColor(){colorLabel();hit('/color/set?en='+(($('colorEn').checked)?1:0)+'&r='+(+$('colorR').value||0)+'&g='+(+$('colorG').value||0)+'&b='+(+$('colorB').value||0));}
+function applyUndergroundLook(){
+  $('colorR').value=100; $('colorG').value=70; $('colorB').value=48;
+  $('colorEn').checked=true;
+  applyColor();
+}
 function colorPreset(name){
-  const p={white:[255,255,255],amber:[255,140,20],red:[255,0,0],green:[0,255,70],blue:[0,70,255],cyan:[0,220,255],magenta:[255,0,220]}[name]||[255,255,255];
+  const normal={white:[255,255,255],amber:[255,140,20],red:[255,0,0],green:[0,255,70],blue:[0,70,255],cyan:[0,220,255],magenta:[255,0,220]};
+  const underground={white:[180,180,170],amber:[120,80,30],red:[120,10,10],green:[10,70,20],blue:[12,32,85],cyan:[20,70,70],magenta:[75,15,65]};
+  const p=((undergroundMode?underground:normal)[name])||[180,180,170];
   $('colorR').value=p[0]; $('colorG').value=p[1]; $('colorB').value=p[2]; $('colorEn').checked=true;
   applyColor();
 }
@@ -1541,16 +1804,39 @@ function queueNetMaster(v){$('netMasterPct').textContent=Math.round(v/255*100)+'
 function netRecall(i){hit('/net/scene/recall?n='+i+'&fade='+(+$('netFade').value||0));}
 async function loadFleet(){const r=await qs('/peers');if(!r)return;const c=r.count||0;$('fleetList').innerHTML=c?r.peers.map(p=>`<b>${escHtml(p.name)}</b> · ${escHtml(p.ip)} · ${p.age_s}s ago`).join('<br>'):'This node only — no peers on network';}
 
+function initRouteWork(){
+  if(route==='/patch'){
+    loadFixtures();
+    loadPage();
+    fixtureTimer=setInterval(loadFixtures,4000);
+    pagePollTimer=setInterval(async()=>{const s=await qs('/page?i='+curPage); if(!s) return; pageWeb=s.web||[]; pageOut=s.out||[]; refreshOutGrid();},1000);
+    return;
+  }
+  if(route==='/system'){
+    setTimeout(()=>{refreshMonitor(); loadManifest();},30);
+    return;
+  }
+  if(route==='/network'){
+    setTimeout(loadPeers,30);
+    return;
+  }
+  if(route==='/vj'){
+    refreshVj();
+    vjTimer=setInterval(refreshVj,2000);
+    loadFleet();
+    fleetTimer=setInterval(loadFleet,5000);
+  }
+}
+
 $('modeSel').addEventListener('change',applyMode); $('netModeSel').addEventListener('change',applyNetMode); $('master').addEventListener('input',e=>queueMaster(+e.target.value)); $('perfMaster').addEventListener('input',e=>queueMaster(+e.target.value)); $('pageSel').addEventListener('change',e=>{curPage=+e.target.value;loadPage();});
 
 const ws=new WebSocket('ws://'+location.host+'/ws');
 ws.onmessage=e=>{let s; try{s=JSON.parse(e.data);}catch{return;} state=s; updatePills(s); syncFields(s);};
 ws.onclose=()=>setTimeout(()=>location.reload(),2000);
 
-setActiveRoute(); makeScenes(); makePages(); loadPage(); refreshMonitor(); loadManifest(); loadPeers(); loadFleet();
-setInterval(async()=>{const s=await qs('/page?i='+curPage); if(!s) return; pageWeb=s.web||[]; pageOut=s.out||[]; refreshOutGrid();},1000);
-refreshVj(); vjTimer=setInterval(refreshVj,2000);
-setInterval(loadFleet,5000);
+setActiveRoute(); makeScenes(); makePages();
+setUndergroundModeUI();
+initRouteWork();
 </script>
 </body></html>)HTML";
 
@@ -1579,6 +1865,11 @@ static size_t fillStatusJSON(char* buf, size_t n) {
   jsonEsc(eMdns,    sizeof(eMdns),    mdnsName);
   uint8_t apClients = WiFi.softAPgetStationNum();
   int32_t staRssi = staCon ? WiFi.RSSI() : 0;
+  uint8_t snapPeers = 0;
+  if (xSemaphoreTake(gLock, pdMS_TO_TICKS(2)) == pdTRUE) {
+    snapPeers = peerCount;
+    xSemaphoreGive(gLock);
+  }
 
   int written = snprintf(buf, n,
     "{"
@@ -1605,7 +1896,11 @@ static size_t fillStatusJSON(char* buf, size_t n) {
     "\"ap_clients\":%u,"
     "\"sta_rssi\":%d,"
     "\"mac\":\"%s\","
-    "\"peer_count\":%u"
+    "\"peer_count\":%u,"
+    "\"burn_safe\":%s,"
+    "\"artnet_fallback_to_web\":%s,"
+    "\"safe_ceiling\":%u,"
+    "\"safe_slew_step\":%u"
     "}",
     apIp,
     staIp,
@@ -1626,7 +1921,11 @@ static size_t fillStatusJSON(char* buf, size_t n) {
     apClients,
     staRssi,
     WiFi.macAddress().c_str(),
-    peerCount
+    snapPeers,
+    burnSafeMode ? "true" : "false",
+    artnetFallbackToWeb ? "true" : "false",
+    effectiveSafeMaxLevel(),
+    effectiveSafeSlewStep()
   );
   if (written < 0) {
     buf[0] = '\0';
@@ -1647,23 +1946,23 @@ static String peersJSON() {
   uint32_t now = millis();
   int pos = 0;
   if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) == pdTRUE) {
-    pos = snprintf(buf, sizeof(buf), "{\"count\":%u,\"peers\":[", peerCount);
+    jsonAppend(buf, sizeof(buf), pos, "{\"count\":%u,\"peers\":[", peerCount);
     for (uint8_t i = 0; i < peerCount; i++) {
-      if (i) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+      if (i) jsonAppend(buf, sizeof(buf), pos, ",");
       char eName[44], eMdns[52];
       jsonEsc(eName, sizeof(eName), peers[i].name);
       jsonEsc(eMdns, sizeof(eMdns), peers[i].mdns);
       char eMac[20]; jsonEsc(eMac, sizeof(eMac), peers[i].mac);
-      pos += snprintf(buf + pos, sizeof(buf) - pos,
+      jsonAppend(buf, sizeof(buf), pos,
         "{\"name\":\"%s\",\"ip\":\"%s\",\"mdns\":\"%s\",\"mac\":\"%s\",\"age_s\":%lu}",
         eName, peers[i].ip, eMdns, eMac,
         (unsigned long)((now - peers[i].lastSeenMs) / 1000));
     }
     xSemaphoreGive(gLock);
   } else {
-    pos = snprintf(buf, sizeof(buf), "{\"count\":0,\"peers\":[");
+    jsonAppend(buf, sizeof(buf), pos, "{\"count\":0,\"peers\":[");
   }
-  snprintf(buf + pos, sizeof(buf) - pos, "]}");
+  jsonAppend(buf, sizeof(buf), pos, "]}");
   return buf;
 }
 
@@ -1683,14 +1982,15 @@ static String pageJSON(uint16_t page) {
   }
 
   char buf[440];
-  int pos = snprintf(buf, sizeof(buf),
+  int pos = 0;
+  jsonAppend(buf, sizeof(buf), pos,
     "{\"page\":%u,\"base_ch\":%u,\"web\":[", page, base + 1);
   for (int i = 0; i < PAGE_SIZE; i++)
-    pos += snprintf(buf + pos, sizeof(buf) - pos, i < PAGE_SIZE-1 ? "%u," : "%u", snapWeb[i]);
-  pos += snprintf(buf + pos, sizeof(buf) - pos, "],\"out\":[");
+    jsonAppend(buf, sizeof(buf), pos, i < PAGE_SIZE-1 ? "%u," : "%u", snapWeb[i]);
+  jsonAppend(buf, sizeof(buf), pos, "],\"out\":[");
   for (int i = 0; i < PAGE_SIZE; i++)
-    pos += snprintf(buf + pos, sizeof(buf) - pos, i < PAGE_SIZE-1 ? "%u," : "%u", snapOut[i]);
-  snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    jsonAppend(buf, sizeof(buf), pos, i < PAGE_SIZE-1 ? "%u," : "%u", snapOut[i]);
+  jsonAppend(buf, sizeof(buf), pos, "]}");
   return buf;
 }
 
@@ -1705,10 +2005,11 @@ static String monitorJSON() {
   }
 
   char buf[360];
-  int pos = snprintf(buf, sizeof(buf), "{\"busy\":%s,\"out\":[", busy ? "true" : "false");
+  int pos = 0;
+  jsonAppend(buf, sizeof(buf), pos, "{\"busy\":%s,\"out\":[", busy ? "true" : "false");
   for (int i = 0; i < 64; i++)
-    pos += snprintf(buf + pos, sizeof(buf) - pos, i < 63 ? "%u," : "%u", snapOut[i]);
-  snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    jsonAppend(buf, sizeof(buf), pos, i < 63 ? "%u," : "%u", snapOut[i]);
+  jsonAppend(buf, sizeof(buf), pos, "]}");
   return buf;
 }
 
@@ -1721,16 +2022,42 @@ static String groupsJSON() {
   } else {
     memset(snap, 0, sizeof(snap));
   }
-  int pos = snprintf(buf, sizeof(buf), "{\"count\":%u,\"groups\":[", MAX_GROUPS);
+  int pos = 0;
+  jsonAppend(buf, sizeof(buf), pos, "{\"count\":%u,\"groups\":[", MAX_GROUPS);
   for (uint8_t i = 0; i < MAX_GROUPS; i++) {
-    if (i) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+    if (i) jsonAppend(buf, sizeof(buf), pos, ",");
     char eName[24];
     jsonEsc(eName, sizeof(eName), snap[i].name);
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    jsonAppend(buf, sizeof(buf), pos,
       "{\"id\":%u,\"name\":\"%s\",\"start\":%u,\"end\":%u,\"enabled\":%s}",
       i, eName, snap[i].start, snap[i].end, snap[i].enabled ? "true" : "false");
   }
-  snprintf(buf + pos, sizeof(buf) - pos, "]}");
+  jsonAppend(buf, sizeof(buf), pos, "]}");
+  return buf;
+}
+
+static String fixturesJSON() {
+  char buf[1800];
+  FixtureDef snap[MAX_FIXTURES];
+  uint8_t snapCount = 0;
+  if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) == pdTRUE) {
+    memcpy(snap, fixtures, sizeof(snap));
+    snapCount = fixtureCount;
+    xSemaphoreGive(gLock);
+  } else {
+    memset(snap, 0, sizeof(snap));
+  }
+  int pos = 0;
+  jsonAppend(buf, sizeof(buf), pos, "{\"count\":%u,\"fixtures\":[", snapCount);
+  for (uint8_t i = 0; i < snapCount && i < MAX_FIXTURES; i++) {
+    if (i) jsonAppend(buf, sizeof(buf), pos, ",");
+    char eName[24];
+    jsonEsc(eName, sizeof(eName), snap[i].name);
+    jsonAppend(buf, sizeof(buf), pos,
+      "{\"id\":%u,\"name\":\"%s\",\"start\":%u,\"end\":%u,\"x\":%u,\"y\":%u,\"enabled\":%s}",
+      i, eName, snap[i].start, snap[i].end, snap[i].x, snap[i].y, snap[i].enabled ? "true" : "false");
+  }
+  jsonAppend(buf, sizeof(buf), pos, "]}");
   return buf;
 }
 
@@ -1744,6 +2071,7 @@ static const char* fxModeName(FxMode m) {
     case FX_COMET:  return "comet";
     case FX_BARS:   return "bars";
     case FX_GLITCH: return "glitch";
+    case FX_RADAR:  return "radar";
     default:        return "none";
   }
 }
@@ -1763,16 +2091,17 @@ static String cueJSON() {
     snapNext = cueNextMs;
     xSemaphoreGive(gLock);
   }
-  int pos = snprintf(buf, sizeof(buf),
+  int pos = 0;
+  jsonAppend(buf, sizeof(buf), pos,
     "{\"running\":%s,\"count\":%u,\"index\":%u,\"next_ms\":%lu,\"steps\":[",
     snapRunning ? "true" : "false", snapCount, snapIndex, (unsigned long)snapNext);
   for (uint8_t i = 0; i < snapCount && i < MAX_CUES; i++) {
-    if (i) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    if (i) jsonAppend(buf, sizeof(buf), pos, ",");
+    jsonAppend(buf, sizeof(buf), pos,
       "{\"idx\":%u,\"scene\":%u,\"dwell\":%lu,\"fade\":%lu}",
       i, snap[i].scene, (unsigned long)snap[i].dwellMs, (unsigned long)snap[i].fadeMs);
   }
-  snprintf(buf + pos, sizeof(buf) - pos, "]}");
+  jsonAppend(buf, sizeof(buf), pos, "]}");
   return buf;
 }
 
@@ -1798,6 +2127,19 @@ static String fxJSON() {
   snprintf(buf, sizeof(buf),
     "{\"enabled\":%s,\"mode\":%u,\"mode_name\":\"%s\",\"bpm\":%u,\"depth\":%u,\"color_en\":%s,\"r\":%u,\"g\":%u,\"b\":%u,\"osc_port\":%u}",
     en ? "true" : "false", uint8_t(m), fxModeName(m), bpm, depth, cEn ? "true" : "false", r, g, b, OSC_PORT);
+  return buf;
+}
+
+static String safetyJSON() {
+  char buf[180];
+  snprintf(buf, sizeof(buf),
+    "{\"burn_safe\":%s,\"safe_ceiling\":%u,\"safe_slew_step\":%u,\"normal_ceiling\":%u,\"normal_slew_step\":%u,\"artnet_fallback_to_web\":%s}",
+    burnSafeMode ? "true" : "false",
+    effectiveSafeMaxLevel(),
+    effectiveSafeSlewStep(),
+    SAFE_MAX_LEVEL,
+    SAFE_SLEW_STEP,
+    artnetFallbackToWeb ? "true" : "false");
   return buf;
 }
 
@@ -1842,7 +2184,7 @@ static String nodeManifestJSON() {
       "{\"id\":\"osc\",\"role\":\"input\",\"transport\":\"udp\",\"port\":%u},"
       "{\"id\":\"dmx512\",\"role\":\"physical-output\",\"channels\":%d}"
     "],"
-    "\"state\":{\"output_mode\":\"%s\",\"master\":%u,\"artnet_active\":%s,\"sacn_active\":%s,\"web_enabled\":%s,\"fx_mode\":\"%s\",\"fx_enabled\":%s,\"color_enabled\":%s},"
+    "\"state\":{\"output_mode\":\"%s\",\"master\":%u,\"artnet_active\":%s,\"sacn_active\":%s,\"web_enabled\":%s,\"fx_mode\":\"%s\",\"fx_enabled\":%s,\"color_enabled\":%s,\"burn_safe\":%s,\"safe_ceiling\":%u,\"safe_slew_step\":%u},"
     "\"sync\":{\"source\":\"firmware\",\"live_status\":\"/ws\",\"durable_config\":\"ESP32 Preferences NVS\",\"git_policy\":\"verify, commit, push origin/main\"}"
     "}",
     PRODUCT_NAME,
@@ -1855,7 +2197,7 @@ static String nodeManifestJSON() {
     SACN_PORT, universe(),
     OSC_PORT,
     MAX_CH,
-    modeName(mode), masterDimmer, artnetActive() ? "true" : "false", sacnActive() ? "true" : "false", webEnabled ? "true" : "false", fxModeName(snapFxMode), snapFxEnabled ? "true" : "false", snapColorEnabled ? "true" : "false"
+    modeName(mode), masterDimmer, artnetActive() ? "true" : "false", sacnActive() ? "true" : "false", webEnabled ? "true" : "false", fxModeName(snapFxMode), snapFxEnabled ? "true" : "false", snapColorEnabled ? "true" : "false", burnSafeMode ? "true" : "false", effectiveSafeMaxLevel(), effectiveSafeSlewStep()
   );
   return buf;
 }
@@ -1921,7 +2263,10 @@ static void setupWeb() {
   server.addHandler(&ws);
 
   auto sendApp = [](AsyncWebServerRequest* r){
-    r->send(200, "text/html", reinterpret_cast<const uint8_t*>(APP_HTML), sizeof(APP_HTML) - 1);
+    AsyncWebServerResponse* res = r->beginResponse_P(
+      200, "text/html", reinterpret_cast<const uint8_t*>(APP_HTML), sizeof(APP_HTML) - 1);
+    res->addHeader("Cache-Control", "no-store");
+    r->send(res);
   };
   server.on("/",            HTTP_GET, sendApp);
   server.on("/control",     HTTP_GET, sendApp);
@@ -1934,6 +2279,7 @@ static void setupWeb() {
 
   server.on("/status",  HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, statusJSON()); });
   server.on("/monitor", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, monitorJSON()); });
+  server.on("/safety/status", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, safetyJSON()); });
   server.on("/node/manifest", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, nodeManifestJSON()); });
   server.on("/manifest.json", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, nodeManifestJSON()); });
 
@@ -1943,7 +2289,7 @@ static void setupWeb() {
     sendJSON(r, pageJSON(p));
   });
 
-  server.on("/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeSet = [](AsyncWebServerRequest* r){
     if (!r->hasArg("ch") || !r->hasArg("v")) { r->send(400, "text/plain", "missing arg"); return; }
     uint16_t ch = uint16_t(constrain(r->arg("ch").toInt(), 1, MAX_CH)) - 1;
     uint8_t  v  = uint8_t(constrain(r->arg("v").toInt(), 0, 255));
@@ -1954,9 +2300,11 @@ static void setupWeb() {
     webVals[ch] = v;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/set", HTTP_GET, routeSet);
+  server.on("/set", HTTP_POST, routeSet);
 
-  server.on("/blackout", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeBlackout = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) {
       r->send(503, "text/plain", "busy");
       return;
@@ -1965,9 +2313,11 @@ static void setupWeb() {
     fadeActive = false;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/blackout", HTTP_GET, routeBlackout);
+  server.on("/blackout", HTTP_POST, routeBlackout);
 
-  server.on("/full", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeFull = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) {
       r->send(503, "text/plain", "busy");
       return;
@@ -1976,51 +2326,126 @@ static void setupWeb() {
     fadeActive = false;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/full", HTTP_GET, routeFull);
+  server.on("/full", HTTP_POST, routeFull);
 
-  server.on("/master", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (r->hasArg("v"))
+  auto routeMaster = [](AsyncWebServerRequest* r){
+    if (r->hasArg("v")) {
+      if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+        r->send(503, "text/plain", "busy");
+        return;
+      }
       masterDimmer = uint8_t(constrain(r->arg("v").toInt(), 0, 255));
+      xSemaphoreGive(gLock);
+    }
     r->send(204);
-  });
+  };
+  server.on("/master", HTTP_GET, routeMaster);
+  server.on("/master", HTTP_POST, routeMaster);
 
-  server.on("/artnet/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeArtNetSet = [](AsyncWebServerRequest* r){
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
     if (r->hasArg("net"))    artNet    = uint8_t(constrain(r->arg("net").toInt(),    0, 127));
     if (r->hasArg("subnet")) artSubnet = uint8_t(constrain(r->arg("subnet").toInt(), 0, 15));
     if (r->hasArg("uni"))    artUni    = uint8_t(constrain(r->arg("uni").toInt(),    0, 15));
+    xSemaphoreGive(gLock);
     saveConfig();
     refreshSacnSocket();
     r->send(204);
-  });
+  };
+  server.on("/artnet/set", HTTP_GET, routeArtNetSet);
+  server.on("/artnet/set", HTTP_POST, routeArtNetSet);
 
-  server.on("/artout/set", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (r->hasArg("en")) artOutEnabled = r->arg("en").toInt() != 0;
+  auto routeArtOutSet = [](AsyncWebServerRequest* r){
+    if (r->hasArg("en")) {
+      if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+        r->send(503, "text/plain", "busy");
+        return;
+      }
+      artOutEnabled = r->arg("en").toInt() != 0;
+      xSemaphoreGive(gLock);
+    }
     saveConfig(); r->send(204);
-  });
+  };
+  server.on("/artout/set", HTTP_GET, routeArtOutSet);
+  server.on("/artout/set", HTTP_POST, routeArtOutSet);
 
-  server.on("/mode/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeModeSet = [](AsyncWebServerRequest* r){
     if (!r->hasArg("m")) { r->send(400, "text/plain", "missing arg"); return; }
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
     mode = Mode(constrain(r->arg("m").toInt(), 0, int(MODE_HTP)));
+    xSemaphoreGive(gLock);
     saveConfig(); r->send(204);
-  });
+  };
+  server.on("/mode/set", HTTP_GET, routeModeSet);
+  server.on("/mode/set", HTTP_POST, routeModeSet);
 
-  server.on("/netmode/set", HTTP_GET, [](AsyncWebServerRequest* r){
-    if (!r->hasArg("m")) { r->send(400, "text/plain", "missing arg"); return; }
-    netMode = NetMode(constrain(r->arg("m").toInt(), 0, int(NET_AP_ONLY)));
-    saveConfig();
-    r->send(200, "text/plain", "ok,rebooting");
-    pendingReboot = true;
-  });
-
-  server.on("/web/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeModeFallback = [](AsyncWebServerRequest* r){
     if (!r->hasArg("en")) { r->send(400, "text/plain", "missing arg"); return; }
-    webEnabled = r->arg("en").toInt() != 0;
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
+    artnetFallbackToWeb = r->arg("en").toInt() != 0;
+    xSemaphoreGive(gLock);
+    saveConfig();
+    r->send(204);
+  };
+  server.on("/mode/fallback", HTTP_GET, routeModeFallback);
+  server.on("/mode/fallback", HTTP_POST, routeModeFallback);
+
+  auto routeNetModeSet = [](AsyncWebServerRequest* r){
+    if (!r->hasArg("m")) { r->send(400, "text/plain", "missing arg"); return; }
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
+    netMode = NetMode(constrain(r->arg("m").toInt(), 0, int(NET_AP_ONLY)));
+    xSemaphoreGive(gLock);
     saveConfig();
     r->send(200, "text/plain", "ok,rebooting");
     pendingReboot = true;
-  });
+  };
+  server.on("/netmode/set", HTTP_GET, routeNetModeSet);
+  server.on("/netmode/set", HTTP_POST, routeNetModeSet);
 
-  server.on("/scene/save", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeWebSet = [](AsyncWebServerRequest* r){
+    if (!r->hasArg("en")) { r->send(400, "text/plain", "missing arg"); return; }
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
+    webEnabled = r->arg("en").toInt() != 0;
+    xSemaphoreGive(gLock);
+    saveConfig();
+    r->send(200, "text/plain", "ok,rebooting");
+    pendingReboot = true;
+  };
+  server.on("/web/set", HTTP_GET, routeWebSet);
+  server.on("/web/set", HTTP_POST, routeWebSet);
+
+  auto routeSafetySet = [](AsyncWebServerRequest* r){
+    if (!r->hasArg("burn")) { r->send(400, "text/plain", "missing burn"); return; }
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
+    burnSafeMode = r->arg("burn").toInt() != 0;
+    xSemaphoreGive(gLock);
+    saveConfig();
+    r->send(204);
+  };
+  server.on("/safety/set", HTTP_GET, routeSafetySet);
+  server.on("/safety/set", HTTP_POST, routeSafetySet);
+
+  auto routeSceneSave = [](AsyncWebServerRequest* r){
     if (!r->hasArg("n")) { r->send(400, "text/plain", "missing arg"); return; }
     uint8_t n = uint8_t(constrain(r->arg("n").toInt(), 0, SCENE_COUNT - 1));
     uint8_t snap[MAX_CH];
@@ -2032,9 +2457,11 @@ static void setupWeb() {
     xSemaphoreGive(gLock);
     saveScene(n, snap);
     r->send(204);
-  });
+  };
+  server.on("/scene/save", HTTP_GET, routeSceneSave);
+  server.on("/scene/save", HTTP_POST, routeSceneSave);
 
-  server.on("/scene/recall", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeSceneRecall = [](AsyncWebServerRequest* r){
     if (!r->hasArg("n")) { r->send(400, "text/plain", "missing arg"); return; }
     uint8_t  n  = uint8_t(constrain(r->arg("n").toInt(), 0, SCENE_COUNT - 1));
     uint32_t ft = r->hasArg("fade") ? uint32_t(max(0L, r->arg("fade").toInt())) : 0;
@@ -2047,50 +2474,70 @@ static void setupWeb() {
     startFade_locked(target, ft);
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/scene/recall", HTTP_GET, routeSceneRecall);
+  server.on("/scene/recall", HTTP_POST, routeSceneRecall);
 
   server.on("/wifi/scan",   HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, wifiScanJSON()); });
 
-  server.on("/wifi/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeWifiSet = [](AsyncWebServerRequest* r){
     if (!r->hasArg("ssid")) { r->send(400, "text/plain", "missing ssid"); return; }
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
     staSSID = r->arg("ssid");
     staPass = r->hasArg("pass") ? r->arg("pass") : "";
     if (netMode == NET_AP_ONLY) netMode = NET_AP_STA;
+    xSemaphoreGive(gLock);
     saveConfig();
     pendingWifiReconnect = true;
     r->send(204);
-  });
+  };
+  server.on("/wifi/set", HTTP_GET, routeWifiSet);
+  server.on("/wifi/set", HTTP_POST, routeWifiSet);
 
-  server.on("/wifi/forget", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeWifiForget = [](AsyncWebServerRequest* r){
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
     staSSID = ""; staPass = "";
+    xSemaphoreGive(gLock);
     saveConfig();
     pendingWifiForget = true;
     r->send(204);
-  });
+  };
+  server.on("/wifi/forget", HTTP_GET, routeWifiForget);
+  server.on("/wifi/forget", HTTP_POST, routeWifiForget);
 
-  server.on("/node/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeNodeSet = [](AsyncWebServerRequest* r){
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
     if (r->hasArg("name"))    nodeName = r->arg("name");
     if (r->hasArg("ap_ssid")) apSsid   = r->arg("ap_ssid");
     if (r->hasArg("ap_pass")) apPass   = r->arg("ap_pass");
+    xSemaphoreGive(gLock);
     saveConfig();
     startMdns();
     r->send(204);
-  });
+  };
+  server.on("/node/set", HTTP_GET, routeNodeSet);
+  server.on("/node/set", HTTP_POST, routeNodeSet);
 
-  server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeReboot = [](AsyncWebServerRequest* r){
     r->send(200, "text/plain", "Rebooting…");
     pendingReboot = true;
-  });
+  };
+  server.on("/reboot", HTTP_GET, routeReboot);
+  server.on("/reboot", HTTP_POST, routeReboot);
 
   // Factory reset: erase NVS and reboot. Restores MAC-derived SSID, default password.
   server.on("/factory-reset", HTTP_POST, [](AsyncWebServerRequest* r){
     r->send(200, "text/plain", "Factory reset — rebooting with defaults…");
-    delay(100);
-    Preferences p;
-    p.begin("vizzz", false);
-    p.clear();
-    p.end();
-    ESP.restart();
+    pendingFactoryReset = true;
   });
 
   server.on("/discover", HTTP_GET, [](AsyncWebServerRequest* r){
@@ -2115,7 +2562,28 @@ static void setupWeb() {
 
   server.on("/groups", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, groupsJSON()); });
 
-  server.on("/group/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  server.on("/fixtures", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, fixturesJSON()); });
+
+  auto routeFixtureSet = [](AsyncWebServerRequest* r){
+    if (!r->hasArg("i")) { r->send(400, "text/plain", "missing i"); return; }
+    uint8_t i = uint8_t(constrain(r->arg("i").toInt(), 0, MAX_FIXTURES - 1));
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
+    if (r->hasArg("name")) r->arg("name").toCharArray(fixtures[i].name, sizeof(fixtures[i].name));
+    if (r->hasArg("start")) fixtures[i].start = uint16_t(constrain(r->arg("start").toInt(), 1, MAX_CH));
+    if (r->hasArg("end")) fixtures[i].end = uint16_t(constrain(r->arg("end").toInt(), fixtures[i].start, MAX_CH));
+    if (r->hasArg("x")) fixtures[i].x = uint8_t(constrain(r->arg("x").toInt(), 0, 255));
+    if (r->hasArg("y")) fixtures[i].y = uint8_t(constrain(r->arg("y").toInt(), 0, 255));
+    if (r->hasArg("en")) fixtures[i].enabled = r->arg("en").toInt() != 0;
+    if (r->hasArg("count")) fixtureCount = uint8_t(constrain(r->arg("count").toInt(), 1, MAX_FIXTURES));
+    for (uint8_t n = 0; n < MAX_FIXTURES; n++) fixtures[n].enabled = (n < fixtureCount) ? fixtures[n].enabled : false;
+    xSemaphoreGive(gLock);
+    saveFixtures();
+    r->send(204);
+  };
+  server.on("/fixture/set", HTTP_GET, routeFixtureSet);
+  server.on("/fixture/set", HTTP_POST, routeFixtureSet);
+
+  auto routeGroupSet = [](AsyncWebServerRequest* r){
     if (!r->hasArg("g")) { r->send(400, "text/plain", "missing g"); return; }
     uint8_t g = uint8_t(constrain(r->arg("g").toInt(), 0, MAX_GROUPS - 1));
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
@@ -2128,9 +2596,11 @@ static void setupWeb() {
     if (r->hasArg("en")) groups[g].enabled = r->arg("en").toInt() != 0;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/group/set", HTTP_GET, routeGroupSet);
+  server.on("/group/set", HTTP_POST, routeGroupSet);
 
-  server.on("/group/apply", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeGroupApply = [](AsyncWebServerRequest* r){
     if (!r->hasArg("g") || !r->hasArg("v")) { r->send(400, "text/plain", "missing arg"); return; }
     uint8_t g = uint8_t(constrain(r->arg("g").toInt(), 0, MAX_GROUPS - 1));
     uint8_t v = uint8_t(constrain(r->arg("v").toInt(), 0, 255));
@@ -2145,20 +2615,24 @@ static void setupWeb() {
     for (uint16_t ch = s; ch <= e; ch++) webVals[ch - 1] = v;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/group/apply", HTTP_GET, routeGroupApply);
+  server.on("/group/apply", HTTP_POST, routeGroupApply);
 
   server.on("/cue/status", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, cueJSON()); });
 
-  server.on("/cue/count", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeCueCount = [](AsyncWebServerRequest* r){
     if (!r->hasArg("c")) { r->send(400, "text/plain", "missing c"); return; }
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
     cueCount = uint8_t(constrain(r->arg("c").toInt(), 1, MAX_CUES));
     if (cueIndex >= cueCount) cueIndex = 0;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/cue/count", HTTP_GET, routeCueCount);
+  server.on("/cue/count", HTTP_POST, routeCueCount);
 
-  server.on("/cue/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeCueSet = [](AsyncWebServerRequest* r){
     if (!r->hasArg("i")) { r->send(400, "text/plain", "missing i"); return; }
     uint8_t i = uint8_t(constrain(r->arg("i").toInt(), 0, MAX_CUES - 1));
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
@@ -2167,9 +2641,11 @@ static void setupWeb() {
     if (r->hasArg("fade"))  cueList[i].fadeMs  = uint32_t(max(0L, r->arg("fade").toInt()));
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/cue/set", HTTP_GET, routeCueSet);
+  server.on("/cue/set", HTTP_POST, routeCueSet);
 
-  server.on("/cue/run", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeCueRun = [](AsyncWebServerRequest* r){
     if (!r->hasArg("en")) { r->send(400, "text/plain", "missing en"); return; }
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
     cueRunning = (r->arg("en").toInt() != 0) && cueCount > 0;
@@ -2182,9 +2658,11 @@ static void setupWeb() {
     }
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/cue/run", HTTP_GET, routeCueRun);
+  server.on("/cue/run", HTTP_POST, routeCueRun);
 
-  server.on("/cue/next", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeCueNext = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
     if (cueCount == 0) { xSemaphoreGive(gLock); r->send(400, "text/plain", "no cues"); return; }
     cueIndex = (cueIndex + 1) % cueCount;
@@ -2192,11 +2670,13 @@ static void setupWeb() {
     xSemaphoreGive(gLock);
     triggerCueStep(next);
     r->send(204);
-  });
+  };
+  server.on("/cue/next", HTTP_GET, routeCueNext);
+  server.on("/cue/next", HTTP_POST, routeCueNext);
 
   server.on("/fx/status", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, fxJSON()); });
 
-  server.on("/fx/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeFxSet = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
     if (r->hasArg("mode")) {
       String m = r->arg("mode");
@@ -2208,6 +2688,7 @@ static void setupWeb() {
       else if (m == "comet"   || m == "6") fxMode = FX_COMET;
       else if (m == "bars"    || m == "7") fxMode = FX_BARS;
       else if (m == "glitch"  || m == "8") fxMode = FX_GLITCH;
+      else if (m == "radar"   || m == "9") fxMode = FX_RADAR;
       else fxMode = FX_NONE;
     }
     if (r->hasArg("en")) fxEnabled = r->arg("en").toInt() != 0;
@@ -2216,9 +2697,11 @@ static void setupWeb() {
     if (fxMode == FX_NONE) fxEnabled = false;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/fx/set", HTTP_GET, routeFxSet);
+  server.on("/fx/set", HTTP_POST, routeFxSet);
 
-  server.on("/fx/tap", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeFxTap = [](AsyncWebServerRequest* r){
     uint32_t now = millis();
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
     if (lastTapMs > 0) {
@@ -2235,9 +2718,11 @@ static void setupWeb() {
     lastTapMs = now;
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/fx/tap", HTTP_GET, routeFxTap);
+  server.on("/fx/tap", HTTP_POST, routeFxTap);
 
-  server.on("/color/set", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeColorSet = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) { r->send(503, "text/plain", "busy"); return; }
     if (r->hasArg("r")) colorR = uint8_t(constrain(r->arg("r").toInt(), 0, 255));
     if (r->hasArg("g")) colorG = uint8_t(constrain(r->arg("g").toInt(), 0, 255));
@@ -2246,7 +2731,9 @@ static void setupWeb() {
     if (colorEnabled) applyColorWash_locked();
     xSemaphoreGive(gLock);
     r->send(204);
-  });
+  };
+  server.on("/color/set", HTTP_GET, routeColorSet);
+  server.on("/color/set", HTTP_POST, routeColorSet);
 
   // ── Peer proxy (forward a command to one specific known peer) ────────────────
   server.on("/peer/cmd", HTTP_GET, [](AsyncWebServerRequest* r){
@@ -2268,7 +2755,7 @@ static void setupWeb() {
   });
 
   // ── Fleet (broadcast to self + all peers) ────────────────────────────────────
-  server.on("/net/blackout", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeNetBlackout = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) {
       r->send(503, "text/plain", "busy");
       return;
@@ -2278,9 +2765,11 @@ static void setupWeb() {
     xSemaphoreGive(gLock);
     if (!enqueueBcast("/blackout")) { r->send(503, "text/plain", "queue full"); return; }
     r->send(204);
-  });
+  };
+  server.on("/net/blackout", HTTP_GET, routeNetBlackout);
+  server.on("/net/blackout", HTTP_POST, routeNetBlackout);
 
-  server.on("/net/full", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeNetFull = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) {
       r->send(503, "text/plain", "busy");
       return;
@@ -2290,19 +2779,28 @@ static void setupWeb() {
     xSemaphoreGive(gLock);
     if (!enqueueBcast("/full")) { r->send(503, "text/plain", "queue full"); return; }
     r->send(204);
-  });
+  };
+  server.on("/net/full", HTTP_GET, routeNetFull);
+  server.on("/net/full", HTTP_POST, routeNetFull);
 
-  server.on("/net/master", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeNetMaster = [](AsyncWebServerRequest* r){
     if (r->hasArg("v")) {
+      if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+        r->send(503, "text/plain", "busy");
+        return;
+      }
       masterDimmer = uint8_t(constrain(r->arg("v").toInt(), 0, 255));
+      xSemaphoreGive(gLock);
     }
     char path[24];
     snprintf(path, sizeof(path), "/master?v=%u", masterDimmer);
     if (!enqueueBcast(path)) { r->send(503, "text/plain", "queue full"); return; }
     r->send(204);
-  });
+  };
+  server.on("/net/master", HTTP_GET, routeNetMaster);
+  server.on("/net/master", HTTP_POST, routeNetMaster);
 
-  server.on("/net/scene/recall", HTTP_GET, [](AsyncWebServerRequest* r){
+  auto routeNetSceneRecall = [](AsyncWebServerRequest* r){
     if (!r->hasArg("n")) { r->send(400, "text/plain", "missing n"); return; }
     uint8_t  n  = uint8_t(constrain(r->arg("n").toInt(), 0, SCENE_COUNT - 1));
     uint32_t ft = r->hasArg("fade") ? uint32_t(max(0L, r->arg("fade").toInt())) : 0;
@@ -2318,7 +2816,9 @@ static void setupWeb() {
     snprintf(path, sizeof(path), "/scene/recall?n=%u&fade=%lu", n, (unsigned long)ft);
     if (!enqueueBcast(path)) { r->send(503, "text/plain", "queue full"); return; }
     r->send(204);
-  });
+  };
+  server.on("/net/scene/recall", HTTP_GET, routeNetSceneRecall);
+  server.on("/net/scene/recall", HTTP_POST, routeNetSceneRecall);
 
   server.onNotFound([](AsyncWebServerRequest* r){ r->send(404, "text/plain", "Not found"); });
   server.begin();
@@ -2377,6 +2877,20 @@ void setup() {
 void loop() {
   if (pendingReboot) { delay(150); ESP.restart(); }
 
+  if (pendingFactoryReset) {
+    pendingFactoryReset = false;
+    Preferences cfg;
+    cfg.begin("cfg", false);
+    cfg.clear();
+    cfg.end();
+    Preferences sc;
+    sc.begin("scenes", false);
+    sc.clear();
+    sc.end();
+    delay(80);
+    ESP.restart();
+  }
+
   if (pendingWifiForget) {
     pendingWifiForget = false;
     WiFi.disconnect(false);
@@ -2412,7 +2926,7 @@ void loop() {
   if (now - lastDmx >= DMX_PERIOD_MS) {
     lastDmx = now;
 
-    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(5)) == pdTRUE) {
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) == pdTRUE) {
       updateFade_locked();
       computeOutput_locked(artnetActive(), sacnActive(), now);
       xSemaphoreGive(gLock);

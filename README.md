@@ -17,6 +17,7 @@ and exposes a black/cyan browser console plus a machine-readable node manifest.
 | **VJ deck** | Mobile-first scene launcher, smoother FX pads, color engine, cue runner, group mixer, and fleet controls |
 | **Scenes** | 8 slots, save/recall with fade |
 | **Master dimmer** | 0-255 applied on the output path |
+| **Burn-safe mode** | Optional stress profile with reduced output ceiling/slew (`/safety/set?burn=1`) |
 | **WebSocket** | Live status push every ~400 ms at `ws://10.0.0.1/ws` |
 | **Node manifest** | `GET /node/manifest` and `GET /manifest.json` |
 | **WiFi** | AP always recoverable, optional STA client mode |
@@ -100,30 +101,44 @@ Art-Net to other nodes on the same network.
 
 ## HTTP API
 
+Mutating routes support both `GET` and `POST` for transition compatibility.
+
 | Method | Path | Query | Description |
 |---|---|---|---|
-| GET | `/set` | `ch=1-512&v=0-255` | Set one web-layer channel |
-| GET | `/blackout` | - | Set all web-layer channels to 0 |
-| GET | `/full` | - | Set all web-layer channels to 255 |
-| GET | `/master` | `v=0-255` | Set master dimmer |
-| GET | `/mode/set` | `m=0\|1\|2` | WEB / ARTNET / HTP |
-| GET | `/netmode/set` | `m=0\|1\|2` | AP_STA / STA_ONLY / AP_ONLY, then reboot |
-| GET | `/artout/set` | `en=0\|1` | Enable Art-Net OUT |
+| GET/POST | `/set` | `ch=1-512&v=0-255` | Set one web-layer channel |
+| GET/POST | `/blackout` | - | Set all web-layer channels to 0 |
+| GET/POST | `/full` | - | Set all web-layer channels to 255 |
+| GET/POST | `/master` | `v=0-255` | Set master dimmer |
+| GET/POST | `/mode/set` | `m=0\|1\|2` | WEB / ARTNET / HTP |
+| GET/POST | `/mode/fallback` | `en=0\|1` | In ARTNET mode, fall back to web layer when network input is inactive |
+| GET/POST | `/netmode/set` | `m=0\|1\|2` | AP_STA / STA_ONLY / AP_ONLY, then reboot |
+| GET/POST | `/artout/set` | `en=0\|1` | Enable Art-Net OUT |
 | GET | `/artout/peer` | `ip=X` | Use one peer as Art-Net OUT unicast target |
-| GET | `/artnet/set` | `net=N&subnet=S&uni=U` | Configure Art-Net/sACN universe |
-| GET | `/scene/save` | `n=0-7` | Save current web layer |
-| GET | `/scene/recall` | `n=0-7&fade=ms` | Recall scene with fade |
-| GET | `/net/blackout` | - | Blackout this node and all discovered peers |
-| GET | `/net/full` | - | Full on this node and all discovered peers |
-| GET | `/net/master` | `v=0-255` | Set master on this node and all discovered peers |
-| GET | `/net/scene/recall` | `n=0-7&fade=ms` | Recall scene on this node and all discovered peers |
+| GET/POST | `/artnet/set` | `net=N&subnet=S&uni=U` | Configure Art-Net/sACN universe |
+| GET/POST | `/scene/save` | `n=0-7` | Save current web layer |
+| GET/POST | `/scene/recall` | `n=0-7&fade=ms` | Recall scene with fade |
+| GET/POST | `/net/blackout` | - | Blackout this node and all discovered peers |
+| GET/POST | `/net/full` | - | Full on this node and all discovered peers |
+| GET/POST | `/net/master` | `v=0-255` | Set master on this node and all discovered peers |
+| GET/POST | `/net/scene/recall` | `n=0-7&fade=ms` | Recall scene on this node and all discovered peers |
 | GET | `/wifi/scan` | - | JSON SSID scan |
-| GET | `/wifi/set` | `ssid=X&pass=Y` | Connect STA |
-| GET | `/wifi/forget` | - | Clear STA credentials |
-| GET | `/node/set` | `name=X&ap_ssid=Y&ap_pass=Z` | Update node identity |
+| GET/POST | `/wifi/set` | `ssid=X&pass=Y` | Connect STA |
+| GET/POST | `/wifi/forget` | - | Clear STA credentials |
+| GET/POST | `/node/set` | `name=X&ap_ssid=Y&ap_pass=Z` | Update node identity |
 | GET | `/discover` | - | Return node identity and send a discovery beacon |
 | GET | `/peers` | - | Live discovered peer table |
 | GET | `/peer/cmd` | `ip=X&path=/blackout\|/full...` | Forward an allowed command to one known peer |
+| GET/POST | `/group/set` | `g=0-7&name=X&start=A&end=B&en=0\|1` | Configure one group |
+| GET/POST | `/group/apply` | `g=0-7&v=0-255` | Apply value to one group range |
+| GET/POST | `/cue/count` | `c=1-16` | Set active cue step count |
+| GET/POST | `/cue/set` | `i=0-15&scene=0-7&dwell=ms&fade=ms` | Configure one cue step |
+| GET/POST | `/cue/run` | `en=0\|1` | Start/stop cue runner |
+| GET/POST | `/cue/next` | - | Advance cue runner one step |
+| GET/POST | `/fx/set` | `mode=...&en=0\|1&bpm=20-240&depth=0-255` | Configure FX engine |
+| GET/POST | `/fx/tap` | - | BPM tap tempo input |
+| GET/POST | `/color/set` | `en=0\|1&r=0-255&g=0-255&b=0-255` | Configure color wash |
+| GET/POST | `/safety/set` | `burn=0\|1` | Toggle burn-safe mode |
+| GET | `/safety/status` | - | Burn-safe/effective safety parameters |
 | GET | `/status` | - | Live status JSON |
 | GET | `/page` | `i=0-15` | 32-channel page snapshot |
 | GET | `/monitor` | - | First 64 output channels |
@@ -158,6 +173,24 @@ Future AI/code changes should follow this flow:
 4. Commit verified changes with a clear message.
 5. Push `main` to `origin/main` only when validation passes and the worktree
    contains no unrelated edits.
+
+## Crash Test Tools
+
+Software stress tools live in `tools/`.
+
+```bash
+# HTTP stress/fuzz (safe defaults: burn-safe on, dangerous routes off)
+python3 tools/crash_http.py --host 10.0.0.1 --seconds 300 --workers 10
+
+# UDP parser flood (Art-Net/sACN/OSC + malformed packets)
+python3 tools/crash_udp.py --host 10.0.0.1 --seconds 180 --pps 300
+```
+
+Recommended sequence:
+
+1. Run software-only stress with no fixture bus connected.
+2. Enable hardware and keep burn-safe mode on.
+3. Increase duration/load in stages and watch thermals/fixture behavior.
 
 ## Dependencies
 
