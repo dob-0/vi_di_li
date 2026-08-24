@@ -7,3 +7,5 @@
 .vscode/ipch
 .tmp_*
 __pycache__/
+.venv-pio
+src/secrets.h
