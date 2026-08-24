@@ -4,8 +4,25 @@ Read this before changing the firmware. Keep it short and replace stale facts.
 
 ## Last verified baseline
 
-`f2946cb` - `fix: defer WiFi.begin/disconnect to loop() task`
-Branch: `main`
+`f4c695e` - `fix: 17 defects from the audit, and take the AP password out of the repo`
+Branch: `audit/2026-08-24` (pushed to origin; `main` untouched at `42f1963`)
+RAM 52,740 bytes (16.1%), Flash 927,093 bytes (70.7%), native tests 4/4.
+
+## Last session - 2026-08-24/25
+
+- Audited the firmware in three lanes (DMX/safety, network/HTTP, console UI + docs): 33 findings in `docs/AUDIT_2026_08_24.md`, 17 of them fixed in the same branch.
+- Worst find: all four UDP pollers never called `flush()`, so one oversized datagram killed that input until reboot - OSC at 256 bytes, which TouchOSC exceeds by accident.
+- Also fixed: Art-Net OUT feeding its own IN, a panic button that could set the rig to full, `loadFixtures()` that was never called, group/cue "Save" that only wrote to RAM, and a `/web/set?en=0` that bricked the console beyond serial reflash.
+- Added `tools/simulate_node.py`, which serves the real `APP_HTML` against an in-memory model of the firmware so the console can be run and screenshotted with no ESP32 attached.
+- Added `docs/BUILD_A_NODE.md`; default AP password moved to gitignored `src/secrets.h` (template in `src/secrets.example.h`) so it is not in the public repo.
+
+## Open
+
+- **`d4:e9:f4:ba:6f:cc` still runs the older build** - new password, none of the 17 fixes. Erase + flash when it is next on USB.
+- **Nothing is verified over HTTP.** Fixes are compile/boot-verified only. Put a node on the LAN (console -> WiFi -> join the house network) and re-run `tools/crash_http.py` + `tools/crash_udp.py`, which is the only real proof of the flush fix.
+- **Two boards are dead**: the soldered perfboard node and one other. Both silent on serial at both boot baud rates with power LEDs lit, and no AP. Measure `EN` against `GND` (expect ~3.3 V; near 0 V means held in reset, which is repairable) and check whether the MAX485's `RO` is wired to anything - it must not be.
+- Audit items deliberately not fixed: no auth on any route and `/reboot` by GET; master/ceiling/slew scaling all 512 channels with no channel-role model; `/blackout` doing nothing while a console feeds Art-Net; one shared `Preferences` object across three tasks; `delay(200)` + SoftAP restart inside `/wifi/scan`; peer-table spoofing into `/peer/cmd`; the WiFi scan wedge; `/ws` connection flood; burn-safe invisible in the UI; no DMX health signal; `/vj` at 7.1 screens of scroll with 38 sub-44px tap targets.
+- No pull request opened - the branch is pushed for sharing, nothing is merged.
 
 ## What works
 
@@ -18,14 +35,14 @@ Branch: `main`
 - Browser console exposes control, patch, scenes, network, system, and VJ routes.
 - Embedded UI is intentionally minimal/mobile-first: hidden helper copy, compact cards, horizontal tabs, large touch targets, and WiFi first on `/network`.
 - WiFi scan enables STA/AP+STA as needed and reports scan failures/timeouts to the UI instead of looping forever.
-- Static RAM is optimized to 49,420 bytes (15.1%); short-lived scene/protocol/output scratch buffers use stack space instead of permanent globals.
-- Flash is optimized to 837,901 bytes (63.9%) by disabling C++ exceptions, disabling Arduino core debug logging, and removing the ArtnetWifi dependency.
+- Static RAM is 52,740 bytes (16.1%); short-lived scene/protocol/output scratch buffers use stack space instead of permanent globals.
+- Flash is 927,093 bytes (70.7%) with C++ exceptions off, Arduino core debug logging off, and no ArtnetWifi dependency.
 - Art-Net IN uses the local `pollArtNet()` WiFiUDP ArtDMX parser; keep it small/non-blocking.
 - WebSocket `/ws` pushes status roughly every 400 ms using a stack JSON buffer to avoid periodic `String` heap churn.
 - DMX output now has built-in safety guardrails: output ceiling (`SAFE_MAX_LEVEL=245`) and per-frame slew limiting (`SAFE_SLEW_STEP=18`) to reduce hard spikes and stress on fixtures/transceiver paths.
 - Burn-safe stress profile added: `/safety/set?burn=1` lowers effective output ceiling/slew (`BURN_SAFE_MAX_LEVEL=96`, `BURN_SAFE_SLEW_STEP=8`) and is exposed in `/status`, `/safety/status`, and node manifest state.
 - UDP ingest loops (Art-Net, sACN, OSC, discovery) now use per-loop packet budgets so heavy inbound traffic cannot starve the main DMX loop.
-- Factory reset route now clears the real Preferences namespaces (`cfg` and `scenes`) instead of an unused namespace.
+- Factory reset clears every namespace the firmware writes: `cfg`, `scenes`, `fixtures`, `vj`.
 - Scenes and VJ are now unified at UI route level: `/scenes` is treated as an alias of `/vj` in the browser app, and the top tab points to one performance surface.
 - WebSocket UI updates are route-aware to reduce browser CPU work (status/system/network/vj DOM blocks update only on their active route).
 - Art-Net and sACN input share the configured universe.
@@ -54,9 +71,12 @@ Branch: `main`
 ## Required validation
 
 ```bash
-/home/nnn/.platformio/penv/bin/pio test -e native
-/home/nnn/.platformio/penv/bin/pio run -e esp32dev
+.venv-pio/bin/pio test -e native
+.venv-pio/bin/pio run -e esp32dev
 ```
+
+PlatformIO lives in a project-local virtualenv. First time:
+`python3 -m venv .venv-pio && .venv-pio/bin/pip install platformio`
 
 ## Known issues
 
@@ -99,3 +119,6 @@ Branch: `main`
 - 2026-05-15: Anti-regression guard for no-light incidents: added persistent `artnetFallbackToWeb` safety behavior (default ON). In `ARTNET_ONLY`, when Art-Net/sACN is inactive, output now falls back to web layer instead of holding stale output. Added `GET/POST /mode/fallback?en=0|1`, plus status visibility via `artnet_fallback_to_web` in `/status` and `/safety/status`. Validation: native tests PASS, esp32 build SUCCESS, upload SUCCESS to `d4:e9:f4:ba:6f:cc`, live check in ARTNET mode shows `web_first=200` and `out_first=200` with no network input.
 - 2026-05-15: Scene UX rewrite for beginners: removed legacy dedicated `/scenes` panel UI and replaced VJ scene controls with a child-friendly flow (`Pick scene` -> `Save This Look` / `Play This Scene`), plus speed presets (`Instant`/`Soft`/`Slow`) and simpler status hints. Backend scene APIs unchanged (`/scene/save`, `/scene/recall`). Validation: native tests PASS, esp32 build SUCCESS.
 - 2026-05-15: Added THUNDER WASH 100 RGB quick mode for 6 fixtures: one-tap `THUNDER 6` patch preset writes six 3-channel fixtures (`TW1..TW6`, channels 1-18, 3x2 stage layout), switches to HTP + radar FX defaults, and applies an underground electro look. Added `Underground Colors` guard toggle plus muted palette mapping in `colorPreset` to avoid overly colorful scenes by default. Validation: native tests PASS, esp32 build SUCCESS, upload SUCCESS to `d4:e9:f4:ba:6f:cc`. Post-flash HTTP reachability from this shell to `10.0.0.1` was timeout-dependent.
+- 2026-08-24: Four boards triaged over USB. `d4:e9:f4:bc:5a:64` and `d4:e9:f4:ba:6f:cc` both answer esptool immediately and were clean-erased and reflashed. Two others - the soldered perfboard node and one more - return zero bytes at 115200 and 74880, with BOOT held and after a forced RTS reset, and broadcast no AP; power LEDs lit on both, so they are powered but not executing. A bare board flashed fine on the same cable and port minutes earlier, so the cable, CH340 driver, toolchain and permissions are all ruled out. Next step is a meter on `EN` vs `GND`.
+- 2026-08-24: Default AP password changed and then removed from the repository. It now comes from gitignored `src/secrets.h`; `src/secrets.example.h` is the template, the fallback placeholder is `changeme123`, and the firmware warns on serial at boot when the placeholder is in use. The branch was rebuilt from `origin/main` before pushing so no password appears in any pushed commit. Verified: `src/secrets.h` returns 404 on GitHub.
+- 2026-08-25: Audit fix pass flashed to `d4:e9:f4:bc:5a:64`. Validation: native tests PASS (4/4), esp32 build SUCCESS, RAM 52,740 bytes (16.1%), Flash 927,093 bytes (70.7%), one clean boot with no brownout and no reset loop. The stage-patch coordinate fix was confirmed in a real browser against `tools/simulate_node.py` - all four default fixtures now render inside the canvas, where previously only F1 and half of F2 did. HTTP behaviour is still unexercised against hardware.
