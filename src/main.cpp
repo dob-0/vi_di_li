@@ -16,6 +16,16 @@
 #include "esp_dmx.h"
 #include "vizzz_core.h"
 
+// The AP password lives in src/secrets.h, which is gitignored. Copy
+// src/secrets.example.h over it and set your own. Without that file the build
+// still succeeds on the placeholder below and warns about it at boot.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+#ifndef AP_PASS_DEFAULT
+  #define AP_PASS_DEFAULT "changeme123"
+#endif
+
 // ── Hardware ──────────────────────────────────────────────────────────────────
 static constexpr int DMX_TX  = 25;
 static constexpr int DMX_DIR = 21;
@@ -42,6 +52,10 @@ static constexpr uint16_t PAGE_SIZE   = 32;
 static constexpr uint16_t PAGE_COUNT  = 16;
 static constexpr uint8_t  SCENE_COUNT = 8;
 static constexpr uint8_t  MAX_FIXTURES = 12;
+static constexpr uint32_t FADE_MAX_MS  = 600000;  // 10 min; see startFade_locked
+static constexpr size_t   MAX_NAME_LEN = 31;      // keeps the 800-byte WS status JSON valid
+static constexpr size_t   MAX_PASS_LEN = 63;
+static constexpr uint32_t WEB_GRACE_MS = 90000;   // console stays up this long even when disabled
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
 enum Mode : uint8_t { MODE_WEB = 0, MODE_ARTNET = 1, MODE_HTP = 2 };
@@ -69,7 +83,7 @@ static constexpr const char* AP_SSID_PREFIX = "vizzz.di";
 static constexpr const char* LEGACY_AP_SSID_PREFIX = "vi_di_li";
 static String  nodeName = PRODUCT_NAME;
 static String  apSsid   = AP_SSID_PREFIX;
-static String  apPass   = "Poghka888$";
+static String  apPass   = AP_PASS_DEFAULT;
 static String  staSSID, staPass;
 static uint8_t artNet = 0, artSubnet = 0, artUni = 0;
 static Mode    mode         = MODE_HTP;
@@ -255,6 +269,12 @@ static void loadFixtures() {
   }
 }
 
+// Groups and cues live in their own namespace. The VJ deck offers "Save Group"
+// and a cue "Save"; before this they only ever wrote to RAM and were lost on the
+// next reboot. /group/apply deliberately does NOT save — it is a live fader and
+// would burn NVS write cycles.
+static void saveVj();
+
 struct CueStep {
   uint8_t scene;       // 0..7
   uint32_t dwellMs;    // hold time after fade
@@ -265,7 +285,9 @@ static CueStep cueList[MAX_CUES];
 static uint8_t cueCount = 0;
 static uint8_t cueIndex = 0;
 static bool cueRunning = false;
-static uint32_t cueNextMs = 0;
+static uint32_t cueNextMs = 0;      // reported in /cue/status only
+static uint32_t cueStartedMs = 0;   // rollover-safe scheduling below
+static uint32_t cueStepMs = 0;
 
 enum FxMode : uint8_t {
   FX_NONE = 0,
@@ -305,6 +327,9 @@ static volatile bool     pendingReboot        = false;
 static volatile bool     pendingWifiReconnect = false;
 static volatile bool     pendingWifiForget    = false;
 static volatile bool     pendingFactoryReset  = false;
+static volatile bool     pendingPanic         = false;
+static volatile bool     pendingBlackout      = false;
+static bool              webStopped           = false;
 
 // ── Broadcast queue (web callbacks write, peer task drains) ───────────────────
 static constexpr uint8_t BCAST_CAP      = 8;
@@ -497,6 +522,15 @@ static String mdnsName;
 static void buildMdnsName();
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
+// True when a datagram came from one of our own interfaces. Art-Net OUT
+// broadcasts the merged frame; without this check a node in MERGE_HTP takes its
+// own output back in and the level can only ever ratchet upwards.
+static bool isOwnIp(const IPAddress& ip) {
+  if (ip == WiFi.softAPIP()) return true;
+  if (WiFi.status() == WL_CONNECTED && ip == WiFi.localIP()) return true;
+  return false;
+}
+
 // Returns the Art-Net target: peer unicast if set, else STA subnet broadcast, else AP broadcast
 static IPAddress artOutTarget() {
   if (!artOutPeerIp.isEmpty()) {
@@ -619,11 +653,13 @@ static void pollDiscovery() {
     if (sz <= 0) break;
 
     int n = discoverUdp.read(buf, min(sz, (int)sizeof(buf) - 1));
+    discoverUdp.flush();  // drop any residue; parsePacket() stalls forever otherwise
     if (n <= 0) continue;
     buf[n] = '\0';
     if (!strstr(buf, "vizzz.di")) continue;  // ignore non-vizzz packets
 
     char pName[40], pIp[16], pIpJson[16], pMdns[48], pMac[18];
+    pMdns[0] = '\0';  // optional in the beacon; without this it leaks stack
     if (!jsonExtract(buf, "name", pName, sizeof(pName))) continue;
     if (!jsonExtract(buf, "ip",   pIpJson, sizeof(pIpJson))) continue;
     jsonExtract(buf, "mdns", pMdns, sizeof(pMdns));
@@ -665,8 +701,17 @@ static void pollDiscovery() {
       peers[peerCount].lastSeenMs = now;
       peerCount++;
     }
+    bool isNewPeer = !found;
     xSemaphoreGive(gLock);
-    sendBeacon();  // reply so the other node also discovers us
+
+    // Reply only to a peer we did not already know, and no more than once a
+    // second. Replying to every beacon makes two nodes trade broadcasts
+    // forever, which eats airtime and wrecks Art-Net timing for the whole LAN.
+    static uint32_t lastBeaconReplyMs = 0;
+    if (isNewPeer && (uint32_t)(now - lastBeaconReplyMs) >= 1000) {
+      lastBeaconReplyMs = now;
+      sendBeacon();
+    }
   }
 }
 
@@ -722,11 +767,53 @@ static void saveScene(uint8_t n, const uint8_t* src) {
   prefs.end();
 }
 
+static void saveVj() {
+  prefs.begin("vj", false);
+  prefs.putBytes("groups", groups, sizeof(groups));
+  prefs.putBytes("cues", cueList, sizeof(cueList));
+  prefs.putUChar("cuecount", cueCount);
+  prefs.end();
+}
+
+static void loadVj() {
+  prefs.begin("vj", true);
+  size_t g = prefs.getBytes("groups", groups, sizeof(groups));
+  size_t c = prefs.getBytes("cues", cueList, sizeof(cueList));
+  uint8_t n = prefs.getUChar("cuecount", cueCount);
+  prefs.end();
+  if (g != sizeof(groups)) {
+    for (uint8_t i = 0; i < MAX_GROUPS; i++) {
+      snprintf(groups[i].name, sizeof(groups[i].name), "G%u", i + 1);
+      groups[i].start = (i * 64) + 1;
+      groups[i].end = min<uint16_t>(MAX_CH, groups[i].start + 63);
+      groups[i].enabled = true;
+    }
+  }
+  if (c == sizeof(cueList)) cueCount = constrain(n, uint8_t(1), MAX_CUES);
+  // Stored values are re-clamped: a struct written by older firmware, or a
+  // corrupted read, must not put an out-of-range channel into the output path.
+  for (uint8_t i = 0; i < MAX_GROUPS; i++) {
+    groups[i].name[sizeof(groups[i].name) - 1] = '\0';
+    groups[i].start = constrain(groups[i].start, uint16_t(1), uint16_t(MAX_CH));
+    groups[i].end   = constrain(groups[i].end, groups[i].start, uint16_t(MAX_CH));
+  }
+  for (uint8_t i = 0; i < MAX_CUES; i++) {
+    if (cueList[i].scene >= SCENE_COUNT) cueList[i].scene = 0;
+    if (cueList[i].fadeMs  > FADE_MAX_MS) cueList[i].fadeMs  = FADE_MAX_MS;
+    if (cueList[i].dwellMs > FADE_MAX_MS) cueList[i].dwellMs = FADE_MAX_MS;
+  }
+  if (cueIndex >= cueCount) cueIndex = 0;
+}
+
 // ── Fade (call with gLock held) ───────────────────────────────────────────────
 static void startFade_locked(const uint8_t* target, uint32_t ms) {
   memcpy(fadeFrom, webVals, MAX_CH);
   memcpy(fadeTo,   target,  MAX_CH);
   fadeStartMs = millis();
+  // updateFade_locked computes (elapsed << 8), which overflows uint32 once
+  // elapsed passes 2^24 ms (~4.7 h) and throws the fade backwards. Ten minutes
+  // is longer than any real cue and leaves three orders of magnitude of margin.
+  if (ms > FADE_MAX_MS) ms = FADE_MAX_MS;
   fadeTimeMs  = ms < 1 ? 1 : ms;
   fadeActive  = true;
 }
@@ -781,14 +868,18 @@ static void triggerCueStep(uint8_t idx) {
 
   if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) return;
   startFade_locked(target, fade);
-  cueNextMs = millis() + fade + dwell;
+  cueStartedMs = millis();
+  cueStepMs    = fade + dwell;
+  cueNextMs    = cueStartedMs + cueStepMs;  // display only; may wrap
   xSemaphoreGive(gLock);
 }
 
 static void tickCueEngine(uint32_t now) {
   uint8_t nextIdx = 0;
   if (xSemaphoreTake(gLock, pdMS_TO_TICKS(5)) != pdTRUE) return;
-  if (!cueRunning || cueCount == 0 || now < cueNextMs) {
+  // Delta comparison, not `now < cueNextMs`. The absolute form free-runs for
+  // ~300 ms every 49.7 days when millis() wraps, firing a scene change per loop.
+  if (!cueRunning || cueCount == 0 || (uint32_t)(now - cueStartedMs) < cueStepMs) {
     xSemaphoreGive(gLock);
     return;
   }
@@ -968,6 +1059,7 @@ static void pollOsc() {
     int sz = oscUdp.parsePacket();
     if (sz <= 0) break;
     int n = oscUdp.read(pkt, min(int(sizeof(pkt)), sz));
+    oscUdp.flush();  // OSC bundles routinely exceed sizeof(pkt); drain the rest
     if (n < 8) continue;
 
     int off = 0;
@@ -1137,7 +1229,9 @@ static void pollArtNet() {
     int size = artInUdp.parsePacket();
     if (size <= 0) break;
     int n = artInUdp.read(pkt, min(int(sizeof(pkt)), size));
+    artInUdp.flush();
     if (n < 18) continue;
+    if (isOwnIp(artInUdp.remoteIP())) continue;  // never merge our own Art-Net OUT back in
     if (memcmp(pkt, artNetId, sizeof(artNetId)) != 0) continue;
     if (!(pkt[8] == 0x00 && pkt[9] == 0x50)) continue; // OpDmx, little-endian
 
@@ -1162,6 +1256,7 @@ static void pollSacn() {
     int size = sacnUdp.parsePacket();
     if (size <= 0) break;
     int n = sacnUdp.read(pkt, min(int(sizeof(pkt)), size));
+    sacnUdp.flush();
     if (n < 126) continue;
 
     // ACN Packet Identifier
@@ -1627,7 +1722,7 @@ function makePages(){ $('pageSel').innerHTML=[...Array(16)].map((_,i)=>`<option 
 function clampFixtureIndex(i){return Math.max(0,Math.min(11,i|0));}
 function fixtureRow(f,i){return `<div class="fixtureCard${i===fixtureSel?' active':''}" onclick="selectFixture(${i})"><b>${escHtml(f.name||('F'+(i+1)))}</b><span>Ch ${f.start}-${f.end} · X ${f.x} · Y ${f.y}</span></div>`;}
 function syncFixtureEditor(){const f=fixtures[fixtureSel]||{name:'F'+(fixtureSel+1),start:1,end:3,x:32,y:32,enabled:true}; $('fixtureSel').value=fixtureSel; $('fxName').value=f.name||('F'+(fixtureSel+1)); $('fxCount').value=Math.max(1,Math.min(12,fixtures.length||4)); $('fxStart').value=f.start||1; $('fxEnd').value=f.end||1; $('fxX').value=f.x??32; $('fxY').value=f.y??32; $('fxXLabel').textContent=String(f.x??32); $('fxYLabel').textContent=String(f.y??32); $('fxEn').checked=!!f.enabled;}
-function renderFixtures(){const stage=$('stageCanvas'); const list=$('fixtureList'); if(!stage||!list) return; const count=Math.max(1,Math.min(12,fixtures.length||4)); stage.innerHTML=fixtures.slice(0,count).map((f,i)=>`<button class="fixtureDot${i===fixtureSel?' active':''}" style="left:${f.x}%;top:${f.y}%" onclick="selectFixture(${i})">${escHtml(f.name||('F'+(i+1)))}<br><span>Ch ${f.start}-${f.end}</span></button>`).join('')||'<div class="footerNote" style="padding:10px">No fixtures loaded</div>'; list.innerHTML=fixtures.slice(0,count).map((f,i)=>fixtureRow(f,i)).join('');}
+function renderFixtures(){const stage=$('stageCanvas'); const list=$('fixtureList'); if(!stage||!list) return; const count=Math.max(1,Math.min(12,fixtures.length||4)); stage.innerHTML=fixtures.slice(0,count).map((f,i)=>`<button class="fixtureDot${i===fixtureSel?' active':''}" style="left:${(Math.max(0,Math.min(255,+f.x||0))*100/255).toFixed(1)}%;top:${(Math.max(0,Math.min(255,+f.y||0))*100/255).toFixed(1)}%" onclick="selectFixture(${i})">${escHtml(f.name||('F'+(i+1)))}<br><span>Ch ${f.start}-${f.end}</span></button>`).join('')||'<div class="footerNote" style="padding:10px">No fixtures loaded</div>'; list.innerHTML=fixtures.slice(0,count).map((f,i)=>fixtureRow(f,i)).join('');}
 function selectFixture(i){fixtureSel=clampFixtureIndex(i); syncFixtureEditor(); renderFixtures();}
 function fixturePrev(){selectFixture(fixtureSel-1);}
 function fixtureNext(){selectFixture(fixtureSel+1);}
@@ -1715,7 +1810,7 @@ function sceneSelectNext(){selectQuickScene((quickSceneSlot+1)%8); if($('sceneAc
 function sceneSaveAndNext(){sceneSaveSelected(); sceneSelectNext();}
 function saveUniverse(){hit(`/artnet/set?net=${$('netInput').value}&subnet=${$('subInput').value}&uni=${$('uniInput').value}`);}
 function toggleArtOut(){artOutEnabled=!artOutEnabled; hit('/artout/set?en='+(artOutEnabled?1:0)); $('aoBtn').textContent='Art OUT '+(artOutEnabled?'ON':'OFF');}
-function toggleWeb(){const next=webEnabled?0:1; if(confirm('This will reboot the device. Continue?')) hit('/web/set?en='+next);}
+function toggleWeb(){const next=webEnabled?0:1; const msg=next?'Re-enable the web console and reboot?':'Turn the web console OFF and reboot?\n\nAfter rebooting you get 90 seconds to reach this page again before it goes quiet. DMX, Art-Net and OSC keep running.'; if(confirm(msg)) hit('/web/set?en='+next);}
 function rebootNow(){if(confirm('Reboot device now?')) hit('/reboot');}
 function refreshStatusDump(){if(state) $('statusDump').textContent=JSON.stringify(state,null,2);}
 function saveNode(){const p=new URLSearchParams(); const n=$('nodeName').value.trim(),s=$('apSsid').value.trim(),pw=$('apPass').value; if(n) p.append('name',n); if(s) p.append('ap_ssid',s); if(pw) p.append('ap_pass',pw); if(!p.toString()) return alert('Nothing to save'); hit('/node/set?'+p).then(()=>setTimeout(()=>hit('/reboot'),250));}
@@ -1730,7 +1825,7 @@ function peerCmd(ip,path){hit('/peer/cmd?ip='+encodeURIComponent(ip)+'&path='+en
 async function loadPeers(){const r=await qs('/peers');if(!r){$('peerCount').textContent='error';return;}const c=r.count||0;$('peerCount').textContent=c?c+(c===1?' peer found':' peers found'):'none found';$('peerList').innerHTML=c?r.peers.map(p=>`<div style="padding:8px;border:1px solid var(--di-cyan-border);margin-bottom:6px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px"><div><b>${escHtml(p.name)}</b> <span class="footerNote">${escHtml(p.ip)}</span><br><span class="footerNote">${escHtml(p.mdns)||''} &bull; <span style="font-family:monospace;font-size:.65rem">${escHtml(p.mac)||''}</span> &bull; ${p.age_s}s ago</span></div><button onclick="window.open('http://${escJsSq(p.ip)}','_blank')" style="min-height:28px;padding:3px 10px;font-size:.7rem;flex:0 0 auto">Open UI</button></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px"><button onclick="peerCmd('${escJsSq(p.ip)}','/blackout')" style="min-height:32px;font-size:.72rem" class="bad">Blackout</button><button onclick="peerCmd('${escJsSq(p.ip)}','/full')" style="min-height:32px;font-size:.72rem" class="good">Full</button><button onclick="targetPeer('${escJsSq(p.ip)}')" style="min-height:32px;font-size:.72rem">Link AO</button></div></div>`).join(''):'<span class="footerNote">No vizzz.di nodes found. Devices must share a WiFi network. Retry after 30s.</span>';}
 function targetPeer(ip){if(!confirm('Route Art-Net OUT directly to '+ip+'? (enables unicast, overrides broadcast)'))return;fetch('/artout/peer?ip='+encodeURIComponent(ip),{cache:'no-store'}).then(()=>fetch('/artout/set?en=1',{cache:'no-store'}));artOutEnabled=true;$('aoBtn').textContent='Art OUT ON';$('aoTarget').textContent=ip;}
 function setMode(m){$('modeSel').value=String(m);hit('/mode/set?m='+m);}
-function vjPanic(){setMode(0);cueRun(0);killFx();killColor();hit('/master?v=255');updateMasterDisplays(255);blackout();}
+function vjPanic(){hit('/panic');updateMasterDisplays(255);setTimeout(refreshVj,300);}
 function setBpmLabel(v){$('bpmLabel').textContent=v+' bpm';}
 function setDepthLabel(v){$('depthLabel').textContent='depth '+v;}
 function markFx(mode){document.querySelectorAll('[data-fx]').forEach(b=>b.classList.toggle('active',b.dataset.fx===mode));$('vjFxRead').textContent=mode||'none';}
@@ -1942,7 +2037,7 @@ static String statusJSON() {
 }
 
 static String peersJSON() {
-  char buf[600];
+  char buf[1024];
   uint32_t now = millis();
   int pos = 0;
   if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -2305,8 +2400,12 @@ static void setupWeb() {
   server.on("/set", HTTP_POST, routeSet);
 
   auto routeBlackout = [](AsyncWebServerRequest* r){
+    // A blackout must never be dropped. If the mutex is busy, defer to loop()
+    // rather than returning 503 and doing nothing — the UI does not retry, so
+    // the old behaviour meant a pressed Blackout button could be a no-op.
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) {
-      r->send(503, "text/plain", "busy");
+      pendingBlackout = true;
+      r->send(202, "text/plain", "queued");
       return;
     }
     memset(webVals, 0, MAX_CH);
@@ -2316,6 +2415,16 @@ static void setupWeb() {
   };
   server.on("/blackout", HTTP_GET, routeBlackout);
   server.on("/blackout", HTTP_POST, routeBlackout);
+
+  // One atomic panic. The old UI fired /master?v=255 and /blackout as two
+  // unordered fetches, so if the blackout lost the race for the mutex the
+  // panic button set the rig to full instead of killing it.
+  auto routePanic = [](AsyncWebServerRequest* r){
+    pendingPanic = true;
+    r->send(204);
+  };
+  server.on("/panic", HTTP_GET, routePanic);
+  server.on("/panic", HTTP_POST, routePanic);
 
   auto routeFull = [](AsyncWebServerRequest* r){
     if (xSemaphoreTake(gLock, pdMS_TO_TICKS(20)) != pdTRUE) {
@@ -2516,9 +2625,12 @@ static void setupWeb() {
       r->send(503, "text/plain", "busy");
       return;
     }
-    if (r->hasArg("name"))    nodeName = r->arg("name");
-    if (r->hasArg("ap_ssid")) apSsid   = r->arg("ap_ssid");
-    if (r->hasArg("ap_pass")) apPass   = r->arg("ap_pass");
+    // fillStatusJSON writes into a fixed 800-byte buffer. An unbounded name
+    // truncates every WebSocket frame into invalid JSON, which the browser
+    // silently swallows — the console then freezes on stale values forever.
+    if (r->hasArg("name"))    { nodeName = r->arg("name"); if (nodeName.length() > MAX_NAME_LEN) nodeName.remove(MAX_NAME_LEN); }
+    if (r->hasArg("ap_ssid")) { apSsid   = r->arg("ap_ssid"); if (apSsid.length() > MAX_NAME_LEN) apSsid.remove(MAX_NAME_LEN); }
+    if (r->hasArg("ap_pass")) { apPass   = r->arg("ap_pass"); if (apPass.length() > MAX_PASS_LEN) apPass.remove(MAX_PASS_LEN); }
     xSemaphoreGive(gLock);
     saveConfig();
     startMdns();
@@ -2556,7 +2668,14 @@ static void setupWeb() {
   server.on("/peers", HTTP_GET, [](AsyncWebServerRequest* r){ sendJSON(r, peersJSON()); });
 
   server.on("/artout/peer", HTTP_GET, [](AsyncWebServerRequest* r){
+    // Written on the AsyncTCP task, read by loop() at DMX rate. Without the
+    // lock a String realloc frees the buffer out from under artOutTarget().
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) != pdTRUE) {
+      r->send(503, "text/plain", "busy");
+      return;
+    }
     artOutPeerIp = r->hasArg("ip") ? r->arg("ip") : "";
+    xSemaphoreGive(gLock);
     r->send(204);
   });
 
@@ -2595,6 +2714,7 @@ static void setupWeb() {
     if (r->hasArg("end")) groups[g].end = uint16_t(constrain(r->arg("end").toInt(), groups[g].start, MAX_CH));
     if (r->hasArg("en")) groups[g].enabled = r->arg("en").toInt() != 0;
     xSemaphoreGive(gLock);
+    saveVj();
     r->send(204);
   };
   server.on("/group/set", HTTP_GET, routeGroupSet);
@@ -2627,6 +2747,7 @@ static void setupWeb() {
     cueCount = uint8_t(constrain(r->arg("c").toInt(), 1, MAX_CUES));
     if (cueIndex >= cueCount) cueIndex = 0;
     xSemaphoreGive(gLock);
+    saveVj();
     r->send(204);
   };
   server.on("/cue/count", HTTP_GET, routeCueCount);
@@ -2640,6 +2761,7 @@ static void setupWeb() {
     if (r->hasArg("dwell")) cueList[i].dwellMs = uint32_t(max(0L, r->arg("dwell").toInt()));
     if (r->hasArg("fade"))  cueList[i].fadeMs  = uint32_t(max(0L, r->arg("fade").toInt()));
     xSemaphoreGive(gLock);
+    saveVj();
     r->send(204);
   };
   server.on("/cue/set", HTTP_GET, routeCueSet);
@@ -2826,12 +2948,23 @@ static void setupWeb() {
 
 // ── Setup / Loop ──────────────────────────────────────────────────────────────
 void setup() {
+  // Park the RS485 driver in receive before anything else. Until dmx_set_pin()
+  // runs — after NVS load and several memsets — this pin is otherwise a
+  // floating input, and a transceiver whose DE floats high can drive the bus
+  // with an undriven TX line.
+  pinMode(DMX_DIR, OUTPUT);
+  digitalWrite(DMX_DIR, LOW);
+
   Serial.begin(115200);
 
   gLock = xSemaphoreCreateMutex();
 
   loadConfig();
   initVjDefaults();
+  // loadFixtures() existed but was never called, so the patch was written to
+  // flash on every edit and silently reset to defaults on every boot.
+  loadFixtures();
+  loadVj();
 
   memset(webVals,  0, MAX_CH);
   memset(artVals,  0, MAX_CH);
@@ -2847,10 +2980,14 @@ void setup() {
   refreshSacnSocket();
   discoverUdp.begin(DISCOVERY_PORT);
   oscUdp.begin(OSC_PORT);
-  if (webEnabled) {
-    startBcastTask();
-    setupWeb();
-  }
+  // The console always starts, even when it is configured off. Previously
+  // /web/set?en=0 persisted to NVS and setup() skipped setupWeb() entirely,
+  // leaving no HTTP server at all — so /web/set?en=1, /reboot and
+  // /factory-reset were all unreachable and the only way back was a serial
+  // reflash. Now every boot gives WEB_GRACE_MS to reach the console and undo
+  // it, after which loop() shuts the server down as asked.
+  startBcastTask();
+  setupWeb();
 
   lastArtnetMs = 0;
   lastSacnMs = 0;
@@ -2872,6 +3009,11 @@ void setup() {
   Serial.printf("Art-Out  : %s\n", artOutEnabled ? "enabled" : "disabled");
   Serial.printf("Web      : %s\n", webEnabled ? "enabled" : "disabled");
   Serial.printf("OSC IN   : udp/%u\n", OSC_PORT);
+  if (apPass == "changeme123") {
+    Serial.printf("WARNING  : placeholder AP password in use.\n");
+    Serial.printf("           cp src/secrets.example.h src/secrets.h, set your\n");
+    Serial.printf("           own AP_PASS_DEFAULT, then reflash.\n");
+  }
 }
 
 void loop() {
@@ -2887,8 +3029,42 @@ void loop() {
     sc.begin("scenes", false);
     sc.clear();
     sc.end();
+    // 'fixtures' was added after this route was written and was never cleared,
+    // so a factory-reset node kept the previous owner's patch.
+    Preferences fx;
+    fx.begin("fixtures", false);
+    fx.clear();
+    fx.end();
+    Preferences vj;
+    vj.begin("vj", false);
+    vj.clear();
+    vj.end();
     delay(80);
     ESP.restart();
+  }
+
+  if (pendingPanic) {
+    if (xSemaphoreTake(gLock, portMAX_DELAY) == pdTRUE) {
+      pendingPanic = false;
+      pendingBlackout = false;
+      mode         = MODE_WEB;      // stop network input driving the rig
+      cueRunning   = false;
+      fxEnabled    = false;
+      colorEnabled = false;
+      fadeActive   = false;
+      masterDimmer = 255;
+      memset(webVals, 0, MAX_CH);
+      xSemaphoreGive(gLock);
+    }
+  }
+
+  if (pendingBlackout) {
+    if (xSemaphoreTake(gLock, portMAX_DELAY) == pdTRUE) {
+      pendingBlackout = false;
+      memset(webVals, 0, MAX_CH);
+      fadeActive = false;
+      xSemaphoreGive(gLock);
+    }
   }
 
   if (pendingWifiForget) {
@@ -2963,7 +3139,14 @@ void loop() {
   }
 
   // WebSocket status push ~400ms (only when web stack is enabled)
-  if (webEnabled) {
+  if (!webEnabled && !webStopped && millis() >= WEB_GRACE_MS) {
+    webStopped = true;
+    ws.closeAll();
+    server.end();
+    Serial.printf("Web disabled after %lu ms grace window\n", (unsigned long)WEB_GRACE_MS);
+  }
+
+  if (!webStopped) {
     static uint32_t lastWs = 0;
     if (now - lastWs >= 400) {
       lastWs = now;
