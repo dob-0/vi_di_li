@@ -62,7 +62,7 @@ static constexpr uint16_t SACN_PORT          = 5568;
 static constexpr uint8_t  SCENE_COUNT        = 8;
 ```
 
-AP: `10.0.0.1`, SSID: `vizzz.di`, generated prefix `vizzz.di_`, pass: `Poghka888$`
+AP: `10.0.0.1`, generated SSID `vizzz.di_<MACSUFFIX>`, pass: set in `src/secrets.h` (gitignored; see `src/secrets.example.h`)
 Art-Net OUT broadcast target: `10.0.0.255:6454`
 
 ---

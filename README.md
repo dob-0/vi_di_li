@@ -44,24 +44,42 @@ DMX output.
 4. Use `/vj` for the VJ controller.
 5. Use `/system` or `/node/manifest` to inspect the firmware-node contract.
 
-Default AP password: `Poghka888$`.
+Default AP password: whatever you set in `src/secrets.h`. That file is
+gitignored so it never reaches the repository — copy the template and edit it:
+
+```bash
+cp src/secrets.example.h src/secrets.h
+```
+
+Without it the firmware still builds, falls back to the placeholder
+`changeme123`, and says so on the serial console at boot. WPA2 needs at least
+eight characters.
 
 ## Build
 
-PlatformIO is installed at `/home/nnn/.platformio/penv/bin/pio` in this
-workspace. The project sets `name = vizzz.di` and `core_dir = .platformio-core`
-so PlatformIO writes project-local cache/lock files instead of the read-only
-user PlatformIO home.
+PlatformIO lives in a project-local virtualenv at `.venv-pio/`. The project sets
+`name = vizzz.di` and `core_dir = .platformio-core` so PlatformIO writes
+project-local cache/lock files instead of the read-only user PlatformIO home.
 
 ```bash
+# One-time setup
+python3 -m venv .venv-pio && .venv-pio/bin/pip install platformio
+
 # Build firmware
-/home/nnn/.platformio/penv/bin/pio run -e esp32dev
+.venv-pio/bin/pio run -e esp32dev
 
 # Upload to ESP32
-sg dialout -c "/home/nnn/.platformio/penv/bin/pio run -e esp32dev --target upload"
+sg dialout -c ".venv-pio/bin/pio run -e esp32dev --target upload"
 
 # Native unit tests
-/home/nnn/.platformio/penv/bin/pio test -e native
+.venv-pio/bin/pio test -e native
+```
+
+To work on the console UI without an ESP32, `tools/simulate_node.py` serves the
+real `APP_HTML` from `src/main.cpp` against an in-memory model of the firmware:
+
+```bash
+python3 tools/simulate_node.py --port 8088   # then open http://127.0.0.1:8088
 ```
 
 ## Device Onboarding
